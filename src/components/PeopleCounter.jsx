@@ -187,8 +187,21 @@ export default function PeopleCounter() {
   const [inFrame,     setInFrame]     = useState(0);
   const [ghosts,      setGhosts]      = useState(0);
   const [log,         setLog]         = useState([]);
-  // BUG FIX: Track backend connectivity status for UI display
   const [backendOnline, setBackendOnline] = useState(true);
+  const [sessionTime,   setSessionTime]   = useState(0); // seconds elapsed
+
+  // ── Session timer ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    const timer = setInterval(() => setSessionTime(s => s + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const fmtTime = s => {
+    const h = String(Math.floor(s / 3600)).padStart(2, '0');
+    const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+    const sec = String(s % 60).padStart(2, '0');
+    return `${h}:${m}:${sec}`;
+  };
 
   // ── Load model ──────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -280,7 +293,6 @@ export default function PeopleCounter() {
     for (const [id, det] of [...pass1.matched, ...pass2.matched]) {
       const prev     = active.get(id);
       const appeared = (prev.appeared || 0) + 1;
-      const alreadyCounted = !!prev.counted;
 
       const updatedTrack = { ...prev, cx: det.cx, cy: det.cy, box: det.box, appeared, disappeared: 0 };
 
@@ -575,7 +587,7 @@ export default function PeopleCounter() {
     }
 
     // Active tracks
-    for (const [id, track] of active) {
+    for (const [, track] of active) {
       const { cx, cy, box, appeared, counted, disappeared, identifying } = track;
       const [bx, by, bw, bh] = box;
       if (disappeared >= MAX_DISAPPEARED) continue;
@@ -702,6 +714,10 @@ export default function PeopleCounter() {
   };
 
   // ── Render ──────────────────────────────────────────────────────────────────
+  // Compute ring stroke offset (440 = full circumference for r=70)
+  // Fill from 0 up to max 50 people; cap at 440 (full circle)
+  const ringOffset = Math.max(0, 440 - Math.min(totalCount / 50, 1) * 440);
+
   return (
     <div className="pc-root">
       <header className="pc-header">
@@ -713,6 +729,11 @@ export default function PeopleCounter() {
           </div>
         </div>
         <div className="pc-header-right">
+          {/* Session timer */}
+          <div className="pc-session-badge">
+            <span style={{fontSize:'0.7rem', color:'var(--text-muted)'}}>⏱</span>
+            <span className="pc-session-time">{fmtTime(sessionTime)}</span>
+          </div>
           <div className="pc-stat-mini">
             <span className="pc-stat-mini-val">{inFrame}</span>
             <span className="pc-stat-mini-label">In Frame</span>
@@ -721,14 +742,13 @@ export default function PeopleCounter() {
             <span className="pc-stat-mini-val">{ghosts}</span>
             <span className="pc-stat-mini-label">Memory</span>
           </div>
-          {/* BUG FIX: Show backend connectivity status */}
           <div className={`pc-status-pill ${backendOnline ? '' : 'pc-status-offline'}`}>
             <span className={`pc-dot ${backendOnline ? 'active' : 'offline-dot'}`} />
             {backendOnline ? 'Face-ID Active' : 'Local Mode ⚡'}
           </div>
           <div className="pc-status-pill">
             <span className={`pc-dot ${modelReady ? 'active' : 'loading'}`} />
-            {modelReady ? 'Model Ready' : 'Loading…'}
+            {modelReady ? 'AI Ready' : 'Loading…'}
           </div>
         </div>
       </header>
@@ -752,10 +772,24 @@ export default function PeopleCounter() {
                 onUserMediaError={() => setCamError(true)}
               />
               <canvas ref={canvasRef} className="pc-canvas" />
+              {/* Scan-line texture */}
+              <div className="pc-camera-scanline" />
+              {/* Moving scan bar */}
+              {modelReady && <div className="pc-camera-scanbar" />}
+              {/* Extra corner brackets */}
+              <div className="pc-corner-tr" />
+              <div className="pc-corner-bl" />
+              {/* REC badge */}
+              {modelReady && (
+                <div className="pc-rec-badge">
+                  <span className="pc-rec-dot" />
+                  LIVE
+                </div>
+              )}
               {!modelReady && (
                 <div className="pc-overlay-loading">
                   <div className="pc-spinner" />
-                  <p className="pc-loading-title">Initializing TensorFlow.js</p>
+                  <p className="pc-loading-title">Initializing AI Engine</p>
                   <p className="pc-loading-sub">Loading COCO-SSD model… ~10 s on first load</p>
                 </div>
               )}
@@ -764,10 +798,26 @@ export default function PeopleCounter() {
         </div>
 
         <aside className="pc-panel">
-          {/* Count card */}
+          {/* Count card with SVG ring */}
           <div className={`pc-card pc-count-card ${justCounted ? 'counted-anim' : ''}`}>
             <p className="pc-card-label">Total Unique People</p>
-            <div className="pc-count-display">{totalCount}</div>
+            <div className="pc-count-ring">
+              <svg viewBox="0 0 160 160" xmlns="http://www.w3.org/2000/svg">
+                <defs>
+                  <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" stopColor="#00f2fe" />
+                    <stop offset="100%" stopColor="#4facfe" />
+                  </linearGradient>
+                </defs>
+                <circle className="pc-count-ring-track" cx="80" cy="80" r="70" />
+                <circle
+                  className="pc-count-ring-fill"
+                  cx="80" cy="80" r="70"
+                  style={{ strokeDashoffset: ringOffset }}
+                />
+              </svg>
+              <div className="pc-count-display">{totalCount}</div>
+            </div>
             <p className="pc-card-hint">Each person counted exactly once — even on re-entry</p>
           </div>
 
@@ -796,8 +846,10 @@ export default function PeopleCounter() {
                 {log.map((entry, i) => (
                   <li key={`${entry.id}-${i}`} className={`pc-log-item ${i === 0 ? 'pc-log-latest' : ''}`}>
                     <span className="pc-log-check">{entry.source === 'local' ? '⚡' : '✓'}</span>
-                    <span className="pc-log-text">Person <strong>ID {entry.id}</strong> counted
+                    <span className="pc-log-text">
+                      Person <strong>ID {entry.id}</strong> counted
                       {entry.source === 'local' && <span className="pc-log-local"> (local)</span>}
+                      {entry.note && <span style={{fontSize:'0.65rem',color:'var(--text-dim)',marginLeft:4}}>{entry.note}</span>}
                     </span>
                     <span className="pc-log-time">{entry.t}</span>
                   </li>
@@ -810,8 +862,8 @@ export default function PeopleCounter() {
           <div className="pc-card pc-legend">
             <p className="pc-card-label">Canvas Legend</p>
             <ul className="pc-legend-list">
-              <li><span className="legend-swatch teal" />Counted <code>✓ ID</code></li>
-              <li><span className="legend-swatch amber" />Scanning — confirming person</li>
+              <li><span className="legend-swatch teal" />Counted person</li>
+              <li><span className="legend-swatch amber" />Scanning — confirming</li>
               <li><span className="legend-swatch purple" />Ghost memory position</li>
             </ul>
           </div>
@@ -819,7 +871,7 @@ export default function PeopleCounter() {
           {/* Controls */}
           <div className="pc-card pc-controls">
             <p className="pc-card-label">Controls</p>
-            <button className="pc-btn pc-btn-danger"    onClick={handleReset}>🔄 Reset Count</button>
+            <button className="pc-btn pc-btn-danger"    onClick={handleReset}>🔄 Reset Count &amp; Memory</button>
             <button className="pc-btn pc-btn-secondary" onClick={toggleCamera}>🔁 Switch Camera</button>
           </div>
 
@@ -827,11 +879,11 @@ export default function PeopleCounter() {
           <div className="pc-card pc-info">
             <p className="pc-card-label">How It Works</p>
             <ol className="pc-info-list">
-              <li><strong>Person-only:</strong> COCO-SSD "person" class ≥ 30% confidence — all other objects ignored.</li>
-              <li><strong>NMS:</strong> Overlapping / nested boxes collapsed to one per body.</li>
-              <li><strong>2-pass matching:</strong> Tight then wide centroid matching per frame.</li>
-              <li><strong>Ghost memory:</strong> People who exit are remembered for ~3 min; re-matched on return — never re-counted.</li>
-              <li><strong>Face-ID:</strong> DeepFace backend identifies the same person across sessions. Falls back to ⚡ local counting when offline.</li>
+              <li><strong>Person-only:</strong> COCO-SSD detects bodies with ≥35% confidence.</li>
+              <li><strong>NMS:</strong> Overlapping boxes collapsed to one per body.</li>
+              <li><strong>2-pass tracking:</strong> Tight then wide centroid matching per frame.</li>
+              <li><strong>Ghost memory:</strong> People remembered for ~3 min after leaving.</li>
+              <li><strong>Face-ID:</strong> DeepFace backend provides identity across sessions.</li>
             </ol>
           </div>
         </aside>
