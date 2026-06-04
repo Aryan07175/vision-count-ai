@@ -16,7 +16,7 @@ const GHOST_RATIO     = 0.08;   // ~115px max distance to revive a ghost
 const DUPE_RATIO      = 0.03;
 const MAX_DETECTIONS  = 50;     // tell COCO-SSD to return up to 50 people
 const DETECT_MS       = 150;
-const IDENTIFY_TIMEOUT = 6000;  // 6s max wait for DeepFace
+const IDENTIFY_TIMEOUT = 15000; // 15s max wait for DeepFace (prevents 'backend offline' on CPU)
 const MAX_NO_FACE_ATTEMPTS = 3; // after 3 failed attempts, count locally (prevents instant overcounting)
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────────
@@ -866,7 +866,7 @@ export default function PeopleCounter() {
                 className="pc-webcam"
                 audio={false}
                 mirrored={facing === 'user'}
-                videoConstraints={{ facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }}
+                videoConstraints={{ facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }}
                 onUserMediaError={() => setCamError(true)}
               />
               <canvas ref={canvasRef} className="pc-canvas" />
