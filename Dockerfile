@@ -12,24 +12,31 @@ RUN npm run build
 
 # Stage 2: Setup the Python backend
 FROM python:3.10-slim
-WORKDIR /app
 
-# Install system dependencies (needed by DeepFace and standard Python libraries)
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     build-essential \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy backend requirements and install
-COPY backend/requirements.txt ./backend/
-RUN pip install --no-cache-dir -r backend/requirements.txt
+# Hugging Face Spaces require running as a non-root user (UID 1000)
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH
+
+WORKDIR $HOME/app
+
+# Copy backend requirements and install as user
+COPY --chown=user backend/requirements.txt ./backend/
+RUN pip install --user --no-cache-dir -r backend/requirements.txt
 
 # Copy the built React app from Stage 1
-COPY --from=build /app/dist ./dist
+COPY --chown=user --from=build /app/dist ./dist
 
 # Copy the backend source code
-COPY backend/ ./backend/
+COPY --chown=user backend/ ./backend/
 
 # Hugging Face Spaces expose port 7860 by default
 EXPOSE 7860
