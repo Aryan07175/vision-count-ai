@@ -21,8 +21,14 @@ import numpy as np
 from deepface import DeepFace
 from typing import Dict, List
 from collections import OrderedDict
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 app = FastAPI()
+
+# ─── API Router for Backend Routes ─────────────────────────────────────────────
+from fastapi import APIRouter
+api_router = APIRouter(prefix="/api")
 FRONTEND_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -190,7 +196,7 @@ def cache_set(key: str, result: dict):
         _result_cache.popitem(last=False)
 
 
-@app.post("/identify")
+@api_router.post("/identify")
 async def identify_person(payload: ImagePayload):
     global next_id
 
@@ -284,7 +290,7 @@ def _run_deepface(img: np.ndarray) -> dict:
     return {"id": new_id, "status": "new", "distance": safe_dist}
 
 
-@app.post("/reset")
+@api_router.post("/reset")
 async def reset_database():
     global next_id
     known_faces.clear()
@@ -294,7 +300,7 @@ async def reset_database():
     return {"status": "reset", "known_people": 0}
 
 
-@app.get("/status")
+@api_router.get("/status")
 async def status():
     return {
         "status": "running",
@@ -302,6 +308,19 @@ async def status():
         "cache_entries": len(_result_cache),
     }
 
+
+app.include_router(api_router)
+
+# ─── Mount React Frontend ──────────────────────────────────────────────────────
+frontend_dist = os.path.join(os.path.dirname(__file__), '..', 'dist')
+if os.path.exists(frontend_dist):
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
+    
+    @app.exception_handler(404)
+    async def custom_404_handler(request, exc):
+        return FileResponse(os.path.join(frontend_dist, 'index.html'))
+else:
+    print(f"Warning: Frontend build directory not found at {frontend_dist}")
 
 if __name__ == "__main__":
     import uvicorn
