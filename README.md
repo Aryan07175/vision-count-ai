@@ -1,3 +1,13 @@
+---
+title: Vision Count AI
+emoji: 👁️
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+app_port: 7860
+---
+
 # VisionCount AI 👁
 
 > **Real-time, browser-based people counter with AI facial recognition.**  
