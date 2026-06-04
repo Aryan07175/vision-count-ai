@@ -10,7 +10,7 @@ const NMS_IOU         = 0.60;   // relaxed → separate people standing close ar
 const NMS_IOM         = 0.85;   // suppress near-duplicate boxes
 const MIN_FRAMES      = 4;      // frames stable before identification attempt
 const MAX_DISAPPEARED = 30;     // ~4.5s before moving to ghost (handles occlusions)
-const GHOST_TTL_MS    = 180_000; // 3 real minutes — immune to CPU slowdowns unlike frame counts
+const GHOST_TTL_MS    = 3000;   // 3 real seconds — only meant for brief occlusions, not minutes
 const MATCH_RATIO     = 0.12;   // ~175px max movement per 150ms frame
 const GHOST_RATIO     = 0.08;   // ~115px max distance to revive a ghost
 const DUPE_RATIO      = 0.03;
@@ -174,6 +174,7 @@ export default function PeopleCounter() {
   const canvasRef   = useRef(null);
   const rafRef      = useRef(null);
   const lastTickRef = useRef(0);
+  const isDetectingRef = useRef(false); // Prevents overlapping inference calls
   const modelRef    = useRef(null);
 
   // FIX (Issue #5): Point all refs at the module-level singletons so their
@@ -258,6 +259,8 @@ export default function PeopleCounter() {
 
   // ── Detection loop ──────────────────────────────────────────────────────────
   const detect = useCallback(async () => {
+    if (isDetectingRef.current) return;
+    
     const model  = modelRef.current;
     const webcam = webcamRef.current;
     const canvas = canvasRef.current;
@@ -267,7 +270,10 @@ export default function PeopleCounter() {
     const vW = video.videoWidth, vH = video.videoHeight;
     if (!vW || !vH) return;
 
-    // BUG FIX: Track whether webcam is currently mirrored for coordinate correction
+    isDetectingRef.current = true;
+
+    try {
+      // BUG FIX: Track whether webcam is currently mirrored for coordinate correction
     const isMirrored = facing === 'user';
 
     canvas.width = vW; canvas.height = vH;
@@ -753,6 +759,9 @@ export default function PeopleCounter() {
     // BUG FIX: Restore context if we flipped it for mirrored mode
     if (isMirrored) {
       ctx.restore();
+    }
+    } finally {
+      isDetectingRef.current = false;
     }
   }, [facing]);
 
