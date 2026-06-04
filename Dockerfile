@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     build-essential \
     ca-certificates \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Hugging Face Spaces require running as a non-root user (UID 1000)
