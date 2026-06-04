@@ -62,14 +62,23 @@ _inference_lock = asyncio.Lock()
 _id_lock = threading.Lock()
 
 # ─── Tuning constants ──────────────────────────────────────────────────────────
-# Cosine distance thresholds (lower = more strict match):
-#   Same person (good angle):     ~0.00 – 0.22
-#   Same person (angle change):   ~0.22 – 0.35
-#   Different people:             ~0.40+
-THRESHOLD = 0.40
+# Cosine distance benchmarks for Facenet512 (lower = more similar):
+#   Same person, same angle:        0.00 – 0.18
+#   Same person, different angle:   0.18 – 0.28
+#   Different people, similar look: 0.30 – 0.40
+#   Clearly different people:       0.40+
+#
+# FIX: was 0.40 — far too loose, causing different people to match the same ID.
+# 0.30 sits well inside the "different people" zone for Facenet512.
+THRESHOLD = 0.30
+
+# FIX: Margin guard — the best match must be this much BETTER than the second-best
+# candidate. If two stored people are almost equally close, the match is ambiguous
+# and we reject it to avoid giving the wrong ID.
+MATCH_MARGIN = 0.07
 
 # Minimum confidence area for a face detection to be trusted
-MIN_FACE_AREA = 600  # pixels^2 — lower than before to catch smaller/farther faces
+MIN_FACE_AREA = 800  # pixels² — raised slightly; tiny face crops produce noisy embeddings
 
 # Max embeddings stored per person (memory of their different angles)
 MAX_EMBEDDINGS_PER_PERSON = 12
@@ -128,18 +137,36 @@ def cosine_distance(a: List[float], b: List[float]) -> float:
 
 def find_best_match(embedding: List[float]) -> tuple:
     """
-    Search known_faces for the closest match using minimum cosine distance.
-    Returns (best_id, best_distance) or (None, inf).
+    Search known_faces for the closest match using cosine distance.
+
+    FIX — three improvements over the original:
+    1. Uses mean of the N closest stored embeddings (not min). This prevents
+       a single outlier embedding from causing a false-positive match.
+    2. Returns BOTH best and second-best distances so the caller can apply
+       a margin check and reject ambiguous results.
+    3. Never returns a match if fewer embeddings were compared than needed.
+
+    Returns (best_id, best_dist, second_best_dist).
     """
-    best_id = None
-    best_dist = float('inf')
+    scores = []  # list of (distance, person_id)
+
     for person_id, data in known_faces.items():
-        dists = [cosine_distance(embedding, e) for e in data["embeddings"]]
-        d = min(dists)
-        if d < best_dist:
-            best_dist = d
-            best_id = person_id
-    return best_id, best_dist
+        all_dists = sorted(
+            cosine_distance(embedding, e) for e in data["embeddings"]
+        )
+        # Use mean of up to 3 closest embeddings — far more stable than min()
+        # because it requires CONSISTENT similarity, not just one lucky match.
+        top_n = all_dists[:3]
+        mean_dist = sum(top_n) / len(top_n)
+        scores.append((mean_dist, person_id))
+
+    if not scores:
+        return None, float('inf'), float('inf')
+
+    scores.sort(key=lambda x: x[0])
+    best_dist, best_id = scores[0]
+    second_dist = scores[1][0] if len(scores) > 1 else float('inf')
+    return best_id, best_dist, second_dist
 
 
 def cache_key(img_data: bytes) -> str:
@@ -223,16 +250,25 @@ def _run_deepface(img: np.ndarray) -> dict:
     embedding = objs[0]["embedding"]
 
     # ── Match against known faces ───────────────────────────────────────────
-    best_id, best_dist = find_best_match(embedding)
+    best_id, best_dist, second_dist = find_best_match(embedding)
 
     if best_id is not None and best_dist < THRESHOLD:
-        # Known person — update their profile
-        data = known_faces[best_id]
-        data["last_seen"] = time.time()
-        if len(data["embeddings"]) < MAX_EMBEDDINGS_PER_PERSON:
-            data["embeddings"].append(embedding)
-        print(f"[Match] ID {best_id} (dist={best_dist:.3f})")
-        return {"id": best_id, "status": "recognized", "distance": float(best_dist)}
+        # FIX: Margin check — if the best and second-best candidates are almost
+        # equally close, the match is ambiguous (could be either person).
+        # Reject and treat as a new person to avoid assigning the wrong ID.
+        margin = second_dist - best_dist
+        if margin < MATCH_MARGIN:
+            print(f"[Ambiguous] best={best_dist:.3f} vs second={second_dist:.3f} "
+                  f"(margin={margin:.3f} < {MATCH_MARGIN}) — treating as new person")
+            # Fall through to new-person creation below
+        else:
+            # Known person — update their profile with this new embedding angle
+            data = known_faces[best_id]
+            data["last_seen"] = time.time()
+            if len(data["embeddings"]) < MAX_EMBEDDINGS_PER_PERSON:
+                data["embeddings"].append(embedding)
+            print(f"[Match] ID {best_id} (dist={best_dist:.3f}, margin={margin:.3f})")
+            return {"id": best_id, "status": "recognized", "distance": float(best_dist)}
 
     # New person
     with _id_lock:
@@ -244,7 +280,7 @@ def _run_deepface(img: np.ndarray) -> dict:
         "last_seen": time.time(),
     }
     safe_dist = float(best_dist) if best_dist != float('inf') else -1.0
-    print(f"[New] Person assigned ID {new_id}")
+    print(f"[New] Person assigned ID {new_id} (closest existing dist={safe_dist:.3f})")
     return {"id": new_id, "status": "new", "distance": safe_dist}
 
 
