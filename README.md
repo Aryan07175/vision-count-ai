@@ -13,6 +13,8 @@ app_port: 7860
 > **Real-time, browser-based people counter with AI facial recognition.**  
 > Detects humans via webcam, assigns each person a unique ID, and ensures nobody is counted twice — even if they leave and come back.
 
+🚀 **[Try the Live Demo Here!](https://aaru07160-vision-count-ai.hf.space/)** 🚀
+
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white)
 ![Vite](https://img.shields.io/badge/Vite-8-646CFF?logo=vite&logoColor=white)
 ![TensorFlow.js](https://img.shields.io/badge/TensorFlow.js-COCO--SSD-FF6F00?logo=tensorflow&logoColor=white)
