@@ -4,6 +4,7 @@ import io
 import asyncio
 import hashlib
 import time
+import threading
 
 # Fix Windows encoding issues — DeepFace logs Unicode that 'charmap' can't handle
 if sys.platform == 'win32':
@@ -18,16 +19,24 @@ import base64
 import cv2
 import numpy as np
 from deepface import DeepFace
-from typing import Dict, List, Optional
+from typing import Dict, List
 from collections import OrderedDict
 
 app = FastAPI()
+FRONTEND_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "FRONTEND_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
 
 # Allow CORS for the React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -47,6 +56,10 @@ _result_cache: OrderedDict = OrderedDict()
 # ─── Concurrency lock ──────────────────────────────────────────────────────────
 # Prevents multiple simultaneous DeepFace calls which would thrash the CPU.
 _inference_lock = asyncio.Lock()
+
+# FIX: next_id is incremented inside a thread executor — protect it with a
+# threading.Lock to prevent two simultaneous requests getting the same ID.
+_id_lock = threading.Lock()
 
 # ─── Tuning constants ──────────────────────────────────────────────────────────
 # Cosine distance thresholds (lower = more strict match):
@@ -169,7 +182,7 @@ async def identify_person(payload: ImagePayload):
 
     # ── 3. Serialize DeepFace calls to prevent CPU overload ───────────────────
     async with _inference_lock:
-        result = await asyncio.get_event_loop().run_in_executor(
+        result = await asyncio.get_running_loop().run_in_executor(
             None, _run_deepface, img
         )
 
@@ -181,7 +194,7 @@ def _run_deepface(img: np.ndarray) -> dict:
     """Synchronous DeepFace inference — runs in a thread executor."""
     global next_id
 
-    objs = None
+    objs = None  # Initialize before loop so 'if not objs' works when all backends fail
     for backend in DETECTOR_BACKENDS:
         try:
             objs = DeepFace.represent(
@@ -222,8 +235,9 @@ def _run_deepface(img: np.ndarray) -> dict:
         return {"id": best_id, "status": "recognized", "distance": float(best_dist)}
 
     # New person
-    new_id = next_id
-    next_id += 1
+    with _id_lock:
+        new_id = next_id
+        next_id += 1
     known_faces[new_id] = {
         "embeddings": [embedding],
         "first_seen": time.time(),

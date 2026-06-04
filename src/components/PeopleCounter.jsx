@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Webcam from 'react-webcam';
-import * as tf from '@tensorflow/tfjs';
-import * as cocoSsd from '@tensorflow-models/coco-ssd';
+// TF imports are loaded dynamically inside the model-loading useEffect.
+// This removes them from the critical-path bundle (saves ~1.3 MB on first load).
 import './PeopleCounter.css';
 
 // ─── CONSTANTS ─────────────────────────────────────────────────────────────────
@@ -10,13 +10,14 @@ const NMS_IOU         = 0.60;   // relaxed → separate people standing close ar
 const NMS_IOM         = 0.85;   // suppress near-duplicate boxes
 const MIN_FRAMES      = 4;      // frames stable before identification attempt
 const MAX_DISAPPEARED = 30;     // ~4.5s before moving to ghost (handles occlusions)
-const GHOST_TTL       = 1200;   // ~3 minutes ghost memory. (Face-ID handles long-term memory)
+const GHOST_TTL_MS    = 180_000; // 3 real minutes — immune to CPU slowdowns unlike frame counts
 const MATCH_RATIO     = 0.12;   // ~175px max movement per 150ms frame
 const GHOST_RATIO     = 0.08;   // ~115px max distance to revive a ghost
 const DUPE_RATIO      = 0.03;
 const MAX_DETECTIONS  = 50;     // tell COCO-SSD to return up to 50 people
 const DETECT_MS       = 150;
-const IDENTIFY_TIMEOUT = 20000; // 20s max wait for DeepFace
+const IDENTIFY_TIMEOUT = 6000;  // 6s max wait for DeepFace
+const MAX_NO_FACE_ATTEMPTS = 3; // after 3 failed attempts, count locally (prevents instant overcounting)
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────────
 const euclidean = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
@@ -154,6 +155,19 @@ async function identifyPerson(video, box, isMirrored) {
   }
 }
 
+// ─── MODULE-LEVEL SINGLETONS ──────────────────────────────────────────────────
+// FIX (Issue #5): React 18 StrictMode deliberately unmounts and remounts every
+// component once in development. If tracking state lives inside useRef() it gets
+// silently reset on the second mount, losing any detections made in the first
+// mount cycle. By hoisting these to module scope they survive the remount.
+// There is only ever one PeopleCounter on screen, so a singleton is safe.
+const _active      = new Map();   // active tracks
+const _ghost       = new Map();   // ghost registry
+const _countedIds  = new Set();   // permanent counted-ID ledger
+let   _nextId      = 0;
+let   _localNextId = 10000;       // offset from backend IDs (which start at 0)
+let   _loadPromise = null;        // shared TF model promise
+
 // ─── COMPONENT ────────────────────────────────────────────────────────────────
 export default function PeopleCounter() {
   const webcamRef   = useRef(null);
@@ -161,23 +175,22 @@ export default function PeopleCounter() {
   const rafRef      = useRef(null);
   const lastTickRef = useRef(0);
   const modelRef    = useRef(null);
-  const loadPromiseRef = useRef(null);
 
-  // Active tracks:  Map<id, { cx, cy, box, appeared, disappeared, counted }>
-  const activeRef   = useRef(new Map());
+  // FIX (Issue #5): Point all refs at the module-level singletons so their
+  // contents persist across StrictMode remount cycles in development.
+  const activeRef          = useRef(_active);
+  const ghostRef           = useRef(_ghost);
+  const countedIds         = useRef(_countedIds);
+  const nextId             = useRef(_nextId);
 
-  // Ghost registry: Map<id, { cx, cy, frame }>
-  // Keeps the last-known position of people who left frame.
-  // Never re-counted because countedIds persists separately.
-  const ghostRef    = useRef(new Map());
-
-  // Permanent set of every ID ever counted — survives ghost expiry
-  const countedIds  = useRef(new Set());
-
-  const nextId      = useRef(0);
-  const frameCount  = useRef(0);
-  // BUG FIX: local fallback counter for when backend is offline
-  const localNextPersonId = useRef(0);
+  // BUG FIX: Local fallback counter starts at 10000 to NEVER clash with
+  // backend Face-IDs (which start at 0 and count up: 0, 1, 2...).
+  // Without this offset, Person A (Face-ID 0) and Person B (Local-ID 0)
+  // would show the same ID number in the UI.
+  const localNextPersonId  = useRef(_localNextId);
+  // FIX: Use a ref instead of window.countAnimTimeout to avoid global
+  // namespace pollution and setState-on-unmounted-component warnings.
+  const countAnimRef = useRef(null);
 
   const [totalCount,  setTotalCount]  = useState(0);
   const [justCounted, setJustCounted] = useState(false);
@@ -207,16 +220,29 @@ export default function PeopleCounter() {
   useEffect(() => {
     let alive = true;
     (async () => {
-      // Deduplicate the loading process across StrictMode remounts
-      if (!loadPromiseRef.current) {
-        loadPromiseRef.current = (async () => {
+      // FIX (Issue #5): Use the module-level _loadPromise so the expensive TF
+      // download is shared across StrictMode remount cycles — never re-fetched.
+      if (!_loadPromise) {
+        _loadPromise = (async () => {
+          // Dynamic imports keep TF.js & COCO-SSD out of the initial JS bundle,
+          // cutting first-load payload from ~1.3 MB to a few KB.
+          const tf      = await import('@tensorflow/tfjs');
+          const cocoSsd = await import('@tensorflow-models/coco-ssd');
+          // FIX: Explicitly select a backend so we don't silently fall back to
+          // CPU. WebGL gives 10-20× faster inference on most devices.
+          try {
+            await tf.setBackend('webgl');
+          } catch {
+            console.warn('[TF] WebGL unavailable, falling back to CPU backend');
+            await tf.setBackend('cpu');
+          }
           await tf.ready();
           return await cocoSsd.load({ base: 'mobilenet_v2' });
         })();
       }
       
       try {
-        const model = await loadPromiseRef.current;
+        const model = await _loadPromise;
         if (!alive) return;
         modelRef.current = model;
         setModelReady(true);
@@ -247,7 +273,6 @@ export default function PeopleCounter() {
     canvas.width = vW; canvas.height = vH;
     const diagLen   = Math.hypot(vW, vH);
     const ghostDist = diagLen * GHOST_RATIO;
-    const frame     = ++frameCount.current;
 
     // ── 1. Detect persons only ─────────────────────────────────────────────
     // Pass MAX_DETECTIONS so COCO-SSD returns up to 30 boxes (default is only 20)
@@ -277,8 +302,11 @@ export default function PeopleCounter() {
     const ghost  = ghostRef.current;
 
     // ── 2. Expire old ghosts ───────────────────────────────────────────────
+    // FIX: Compare real timestamps so ghost TTL is always exactly 3 minutes
+    // regardless of how fast or slow the detection loop is running.
+    const nowMs = Date.now();
     for (const [id, g] of ghost) {
-      if (frame - g.frame > GHOST_TTL) ghost.delete(id);
+      if (nowMs - g.ghostedAt > GHOST_TTL_MS) ghost.delete(id);
     }
 
     // ── 3. Match dets → active tracks (2-pass) ─────────────────────────────
@@ -355,8 +383,8 @@ export default function PeopleCounter() {
                     // They weren't counted yet. Increment count!
                     setTotalCount(n => n + 1);
                     setJustCounted(true);
-                    clearTimeout(window.countAnimTimeout);
-                    window.countAnimTimeout = setTimeout(() => setJustCounted(false), 700);
+                    clearTimeout(countAnimRef.current);
+                    countAnimRef.current = setTimeout(() => setJustCounted(false), 700);
                     const t = new Date().toLocaleTimeString('en-US', { hour12: false });
                     setLog(prevLogs => [{ id: backendId, t, source: 'face-id' }, ...prevLogs].slice(0, 50));
                   } else {
@@ -398,8 +426,8 @@ export default function PeopleCounter() {
                   // Add to total count
                   setTotalCount(n => n + 1);
                   setJustCounted(true);
-                  clearTimeout(window.countAnimTimeout);
-                  window.countAnimTimeout = setTimeout(() => setJustCounted(false), 700);
+                  clearTimeout(countAnimRef.current);
+                  countAnimRef.current = setTimeout(() => setJustCounted(false), 700);
                   
                   const t = new Date().toLocaleTimeString('en-US', { hour12: false });
                   setLog(prevLogs => [{ id: localId, t, source: 'local', note: '(backend offline)' }, ...prevLogs].slice(0, 50));
@@ -409,45 +437,78 @@ export default function PeopleCounter() {
                 }
               }
 
-            // ── CASE 3: Backend said "no_face" ──
+            // ── CASE 3: Backend said "no_face" or timed out ──
             } else {
               if (currentTrack) {
-                if (!currentTrack.counted) {
-                  // FALLBACK: Count them locally if they are looking away (no face detected)
+                const attempts = (currentTrack.noFaceAttempts || 0) + 1;
+                if (!currentTrack.counted && attempts >= MAX_NO_FACE_ATTEMPTS) {
+                  // Person has been in frame multiple times but face never detected.
+                  // Count them locally so they are never missed.
                   const localId = localNextPersonId.current++;
                   currentActive.set(id, {
                     ...currentTrack,
                     personId: localId,
                     counted: true,
                     identifying: false,
-                    localOnly: true // Mark as a local fallback until they show their face
+                    noFaceAttempts: 0,
+                    localOnly: true
                   });
-                  
-                  // Add to total count
                   setTotalCount(n => n + 1);
                   setJustCounted(true);
-                  clearTimeout(window.countAnimTimeout);
-                  window.countAnimTimeout = setTimeout(() => setJustCounted(false), 700);
-                  
+                  clearTimeout(countAnimRef.current);
+                  countAnimRef.current = setTimeout(() => setJustCounted(false), 700);
                   const t = new Date().toLocaleTimeString('en-US', { hour12: false });
-                  setLog(prevLogs => [{ id: localId, t, source: 'local', note: '(no face seen yet)' }, ...prevLogs].slice(0, 50));
+                  setLog(prevLogs => [{ id: localId, t, source: 'local', note: '(counted after retry)' }, ...prevLogs].slice(0, 50));
                 } else {
-                  // They were already counted locally, just reset identifying flag so it tries to upgrade them later
-                  currentActive.set(id, { ...currentTrack, identifying: false });
+                  // Still has attempts left — retry identify after a short delay
+                  currentActive.set(id, { ...currentTrack, identifying: false, noFaceAttempts: attempts });
                 }
               }
             }
           }).catch(() => {
+            // Network error or timeout — treat like a no_face attempt
             const currentTrack = activeRef.current.get(id);
             if (currentTrack) {
-              activeRef.current.set(id, { ...currentTrack, identifying: false });
+              const attempts = (currentTrack.noFaceAttempts || 0) + 1;
+              if (!currentTrack.counted && attempts >= MAX_NO_FACE_ATTEMPTS) {
+                const localId = localNextPersonId.current++;
+                activeRef.current.set(id, {
+                  ...currentTrack,
+                  personId: localId,
+                  counted: true,
+                  identifying: false,
+                  noFaceAttempts: 0,
+                  localOnly: true
+                });
+                setTotalCount(n => n + 1);
+                setJustCounted(true);
+                clearTimeout(countAnimRef.current);
+                countAnimRef.current = setTimeout(() => setJustCounted(false), 700);
+                const t = new Date().toLocaleTimeString('en-US', { hour12: false });
+                setLog(prevLogs => [{ id: localId, t, source: 'local', note: '(timeout fallback)' }, ...prevLogs].slice(0, 50));
+              } else {
+                activeRef.current.set(id, { ...currentTrack, identifying: false, noFaceAttempts: attempts });
+              }
             }
           });
-          continue;
+          // FIX (Issue #4): Guard clause instead of 'continue' — the identify
+          // call was already fired above; skip the track update below so we
+          // don't overwrite the identifying=true state we just set.
+          // The previous pattern (fire-then-continue) worked but was confusing
+          // because the 'continue' appeared to be inside the .then() callback.
+        } else {
+          // Already identifying — update position only, leave identifying=true
+          active.set(id, updatedTrack);
         }
+      } else {
+        // Outer else: needsFaceId=false (already counted), OR appeared < MIN_FRAMES,
+        // OR within 1500ms cooldown. We MUST write updatedTrack in all these cases
+        // so the 'appeared' counter keeps incrementing each frame.
+        // Without this line the track is frozen and identify never triggers.
+        active.set(id, updatedTrack);
       }
-      
-      active.set(id, updatedTrack);
+      // Note: tracks where identifying was fired are NOT written here;
+      // their state is managed exclusively inside the .then()/.catch() above.
     }
 
     // ── 5. Unmatched active tracks: age or ghost ───────────────────────────
@@ -461,7 +522,7 @@ export default function PeopleCounter() {
       const disappeared = t.disappeared + 1;
       if (disappeared > MAX_DISAPPEARED) {
         // Move to ghost registry so re-entry is matched back to same ID
-        ghost.set(id, { ...t, frame });
+        ghost.set(id, { ...t, ghostedAt: Date.now() });
         active.delete(id);
       } else {
         active.set(id, { ...t, disappeared });
@@ -505,6 +566,9 @@ export default function PeopleCounter() {
           box: det.box,
           appeared: MIN_FRAMES,
           disappeared: 0,
+          // If this person was already counted, mark as re-identified so the badge
+          // immediately shows 'Already Detected' on re-entry, without waiting for Face-ID.
+          reidentified: revivedTrack.counted ? true : revivedTrack.reidentified,
         });
 
         continue;
@@ -605,13 +669,30 @@ export default function PeopleCounter() {
       ctx.restore();
 
       // Scan progress bar (while not yet counted)
+      // FIX (Issue #6): Three distinct visual states:
+      //   1. Scanning  (appeared < MIN_FRAMES): bar fills left→right
+      //   2. Identifying (appeared >= MIN_FRAMES, backend pending): pulsing shimmer
+      //   3. Counted: bar hidden
       if (!counted) {
-        const pct = Math.min(appeared / MIN_FRAMES, 1);
         ctx.save();
+        // Background track
         ctx.fillStyle = 'rgba(255,190,50,0.12)';
         ctx.fillRect(bx, by + bh - 5, bw, 5);
-        ctx.fillStyle = '#ffbe32';
-        ctx.fillRect(bx, by + bh - 5, bw * pct, 5);
+
+        if (!identifying) {
+          // Phase 1 — filling progress bar
+          const pct = Math.min(appeared / MIN_FRAMES, 1);
+          ctx.fillStyle = '#ffbe32';
+          ctx.fillRect(bx, by + bh - 5, bw * pct, 5);
+        } else {
+          // Phase 2 — pulsing shimmer: a bright segment sweeps back and forth
+          const t = (Date.now() % 1200) / 1200;          // 0 → 1 in 1.2 s
+          const ping = Math.abs(Math.sin(t * Math.PI)); // 0→1→0 (ping-pong)
+          const seg  = bw * 0.4;                         // shimmer width = 40% of box
+          const startX = bx + (bw - seg) * ping;
+          ctx.fillStyle = 'rgba(100,200,255,0.7)';
+          ctx.fillRect(startX, by + bh - 5, seg, 5);
+        }
         ctx.restore();
       }
 
@@ -631,12 +712,13 @@ export default function PeopleCounter() {
         let label = `⏳ Scanning...`;
         if (counted) {
           const pId = track.personId !== undefined ? track.personId : '?';
+          const displayId = track.localOnly ? `L-${pId - 10000}` : `${pId}`;
           if (track.reidentified) {
-            label = `↩ ALREADY DETECTED (ID ${pId})`;
+            label = `↩ Already Detected (ID ${displayId})`;
           } else if (track.localOnly) {
-            label = disappeared > 0 ? `↩ ID ${pId} ⚡` : `✓ ID ${pId} ⚡`;
+            label = disappeared > 0 ? `↩ ID ${displayId} ⚡` : `✓ ID ${displayId} ⚡`;
           } else {
-            label = disappeared > 0 ? `↩ ID ${pId}` : `✓ ID ${pId}`;
+            label = disappeared > 0 ? `↩ Already Detected (ID ${displayId})` : `✓ ID ${displayId}`;
           }
         } else if (identifying) {
           label = `🔍 Identifying...`;
@@ -650,12 +732,13 @@ export default function PeopleCounter() {
         let label = `⏳ Scanning...`;
         if (counted) {
           const pId = track.personId !== undefined ? track.personId : '?';
+          const displayId = track.localOnly ? `L-${pId - 10000}` : `${pId}`;
           if (track.reidentified) {
-            label = `↩ ALREADY DETECTED (ID ${pId})`;
+            label = `↩ Already Detected (ID ${displayId})`;
           } else if (track.localOnly) {
-            label = disappeared > 0 ? `↩ ID ${pId} ⚡` : `✓ ID ${pId} ⚡`;
+            label = disappeared > 0 ? `↩ ID ${displayId} ⚡` : `✓ ID ${displayId} ⚡`;
           } else {
-            label = disappeared > 0 ? `↩ ID ${pId}` : `✓ ID ${pId}`;
+            label = disappeared > 0 ? `↩ Already Detected (ID ${displayId})` : `✓ ID ${displayId}`;
           }
         } else if (identifying) {
           label = `🔍 Identifying...`;
@@ -688,12 +771,18 @@ export default function PeopleCounter() {
 
   // ── Reset ───────────────────────────────────────────────────────────────────
   const handleReset = () => {
-    activeRef.current.clear();
-    ghostRef.current.clear();
-    countedIds.current.clear();
-    nextId.current = 0;
-    frameCount.current = 0;
-    localNextPersonId.current = 0;
+    // Clear in-component refs AND the module-level singletons so they stay in
+    // sync — a remount after reset must not see stale singleton data.
+    activeRef.current.clear();    _active.clear();
+    ghostRef.current.clear();     _ghost.clear();
+    countedIds.current.clear();   _countedIds.clear();
+    nextId.current = 0;           _nextId = 0;
+    // FIX: Reset to 10000, not 0 — preserves the offset guard that prevents
+    // local fallback IDs from colliding with backend Face-IDs (0, 1, 2…).
+    localNextPersonId.current = 10000;  _localNextId = 10000;
+    // FIX: Clear the animation timer ref on reset to avoid stale callbacks.
+    clearTimeout(countAnimRef.current);
+    countAnimRef.current = null;
     setTotalCount(0);
     setInFrame(0);
     setGhosts(0);

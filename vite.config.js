@@ -12,5 +12,11 @@ export default defineConfig({
         rewrite: (path) => path.replace(/^\/api/, ''),
       }
     }
-  }
+  },
+  build: {
+    // TF.js + COCO-SSD are lazy-loaded via dynamic import() so they are
+    // code-split into a separate chunk. The chunk is still large (~1.3 MB)
+    // because TF is inherently big, so raise the warning limit to avoid noise.
+    chunkSizeWarningLimit: 1600,
+  },
 })
