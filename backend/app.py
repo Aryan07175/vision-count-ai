@@ -96,7 +96,8 @@ MIN_FACE_AREA = 800  # pixels² — raised slightly to avoid noisy embeddings
 MAX_EMBEDDINGS_PER_PERSON = 12
 
 # Detector backends to try, in order of speed vs accuracy
-DETECTOR_BACKENDS = ["ssd", "opencv", "retinaface"]
+# Removed 'retinaface' because it is far too slow and causes the queue to back up when people look away.
+DETECTOR_BACKENDS = ["ssd", "opencv"]
 
 
 class ImagePayload(BaseModel):

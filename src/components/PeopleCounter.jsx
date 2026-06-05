@@ -161,7 +161,7 @@ export default function PeopleCounter() {
   const [justCounted, setJustCounted] = useState(false);
   const [modelReady,  setModelReady]  = useState(false);
   const [camError,    setCamError]    = useState(false);
-  const [facing,      setFacing]      = useState('user');
+  const [facing]              = useState('user');
   const [inFrame,     setInFrame]     = useState(0);
   const [ghosts,      setGhosts]      = useState(0);
   const [log,         setLog]         = useState([]);
