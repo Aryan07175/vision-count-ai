@@ -1,23 +1,21 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Webcam from 'react-webcam';
-// TF imports are loaded dynamically inside the model-loading useEffect.
-// This removes them from the critical-path bundle (saves ~1.3 MB on first load).
+import * as tf from '@tensorflow/tfjs';
+import * as cocoSsd from '@tensorflow-models/coco-ssd';
 import './PeopleCounter.css';
 
 // ─── CONSTANTS ─────────────────────────────────────────────────────────────────
-const CONFIDENCE      = 0.35;   // low threshold → catch far/partially visible people
-const NMS_IOU         = 0.60;   // relaxed → separate people standing close aren't merged
-const NMS_IOM         = 0.85;   // suppress near-duplicate boxes
-const MIN_FRAMES      = 4;      // frames stable before identification attempt
-const MAX_DISAPPEARED = 30;     // ~4.5s before moving to ghost (handles occlusions)
-const GHOST_TTL_MS    = 3000;   // 3 real seconds — only meant for brief occlusions, not minutes
-const MATCH_RATIO     = 0.12;   // ~175px max movement per 150ms frame
-const GHOST_RATIO     = 0.08;   // ~115px max distance to revive a ghost
-const DUPE_RATIO      = 0.03;
-const MAX_DETECTIONS  = 50;     // tell COCO-SSD to return up to 50 people
+const CONFIDENCE      = 0.40;
+const NMS_IOU         = 0.50;
+const NMS_IOM         = 0.85;
+const MIN_FRAMES      = 5;
+const MAX_DISAPPEARED = 45;
+const GHOST_TTL       = 300;
+const MATCH_RATIO     = 0.22;
+const GHOST_RATIO     = 0.30;
+const DUPE_RATIO      = 0.05;
 const DETECT_MS       = 150;
-const IDENTIFY_TIMEOUT = 15000; // 15s max wait for DeepFace (prevents 'backend offline' on CPU)
-const MAX_NO_FACE_ATTEMPTS = 3; // after 3 failed attempts, count locally (prevents instant overcounting)
+const IDENTIFY_TIMEOUT = 10000;  // 10s max wait for DeepFace
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────────
 const euclidean = (ax, ay, bx, by) => Math.hypot(ax - bx, ay - by);
@@ -102,71 +100,40 @@ function drawBadge(ctx, x, y, label, color) {
 }
 
 // ─── API HELPER ───────────────────────────────────────────────────────────────
-// BUG FIX: When the webcam is mirrored (selfie mode), the video stream pixels
-// are NOT flipped — only the CSS display is. So we must un-mirror the canvas
-// crop before sending to backend. We pass `isMirrored` to handle this.
-async function identifyPerson(video, box, isMirrored) {
+async function identifyPerson(video, box) {
   const [x, y, w, h] = box;
   const vW = video.videoWidth;
+  const vH = video.videoHeight;
   
-  // BUG FIX: Send the entire bounding box instead of just the top 35%. 
-  // DeepFace's built-in face detector is much better at finding the face 
-  // within the full body crop, whereas 35% might chop off the face if seated!
-  const cropW = w;
-  const cropH = h;
-  // BUG FIX: If camera is mirrored (front-facing), the CSS flips it but the
-  // raw video stream coordinates are the mirror of what appears on screen.
-  // We must flip x-coordinate to match real pixel position in the stream.
-  const realX = isMirrored ? vW - x - w : x;
-  const cropX = realX;
-  const cropY = y;
+  // Crop the head region (top 35% of the body bounding box)
+  // Clamp boundaries to prevent out-of-range dimensions
+  const cropX = Math.max(0, Math.min(x, vW - 1));
+  const cropY = Math.max(0, Math.min(y, vH - 1));
+  const cropW = Math.max(1, Math.min(w, vW - cropX));
+  const cropH = Math.max(1, Math.min(h * 0.35, vH - cropY));
 
   const canvas = document.createElement('canvas');
   canvas.width = cropW;
   canvas.height = cropH;
   const ctx = canvas.getContext('2d');
   
-  // Draw the video offset to perfectly crop the head/face area
-  ctx.drawImage(video, -cropX, -cropY, video.videoWidth, video.videoHeight);
+  // Safely crop the head/face area using standard drawImage parameters
+  ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
   const base64 = canvas.toDataURL('image/jpeg', 0.8);
   
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), IDENTIFY_TIMEOUT);
-    
     const res = await fetch('/api/identify', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_base64: base64 }),
-      signal: controller.signal
+      body: JSON.stringify({ image_base64: base64 })
     });
-    clearTimeout(timeoutId);
     if (!res.ok) throw new Error('API Error');
     return await res.json();
   } catch (err) {
-    if (err.name === 'AbortError') {
-      console.warn("DeepFace API timeout after", IDENTIFY_TIMEOUT, "ms");
-    } else {
-      console.warn("DeepFace API error:", err);
-    }
-    // BUG FIX: Return a special marker so caller knows backend is offline
-    // and can fall back to local-only counting
-    return { id: null, status: 'offline', distance: -1 };
+    console.warn("DeepFace API error:", err);
+    return null;
   }
 }
-
-// ─── MODULE-LEVEL SINGLETONS ──────────────────────────────────────────────────
-// FIX (Issue #5): React 18 StrictMode deliberately unmounts and remounts every
-// component once in development. If tracking state lives inside useRef() it gets
-// silently reset on the second mount, losing any detections made in the first
-// mount cycle. By hoisting these to module scope they survive the remount.
-// There is only ever one PeopleCounter on screen, so a singleton is safe.
-const _active      = new Map();   // active tracks
-const _ghost       = new Map();   // ghost registry
-const _countedIds  = new Set();   // permanent counted-ID ledger
-let   _nextId      = 0;
-let   _localNextId = 10000;       // offset from backend IDs (which start at 0)
-let   _loadPromise = null;        // shared TF model promise
 
 // ─── COMPONENT ────────────────────────────────────────────────────────────────
 export default function PeopleCounter() {
@@ -174,24 +141,21 @@ export default function PeopleCounter() {
   const canvasRef   = useRef(null);
   const rafRef      = useRef(null);
   const lastTickRef = useRef(0);
-  const isDetectingRef = useRef(false); // Prevents overlapping inference calls
   const modelRef    = useRef(null);
 
-  // FIX (Issue #5): Point all refs at the module-level singletons so their
-  // contents persist across StrictMode remount cycles in development.
-  const activeRef          = useRef(_active);
-  const ghostRef           = useRef(_ghost);
-  const countedIds         = useRef(_countedIds);
-  const nextId             = useRef(_nextId);
+  // Active tracks:  Map<id, { cx, cy, box, appeared, disappeared, counted }>
+  const activeRef   = useRef(new Map());
 
-  // BUG FIX: Local fallback counter starts at 10000 to NEVER clash with
-  // backend Face-IDs (which start at 0 and count up: 0, 1, 2...).
-  // Without this offset, Person A (Face-ID 0) and Person B (Local-ID 0)
-  // would show the same ID number in the UI.
-  const localNextPersonId  = useRef(_localNextId);
-  // FIX: Use a ref instead of window.countAnimTimeout to avoid global
-  // namespace pollution and setState-on-unmounted-component warnings.
-  const countAnimRef = useRef(null);
+  // Ghost registry: Map<id, { cx, cy, frame }>
+  // Keeps the last-known position of people who left frame.
+  // Never re-counted because countedIds persists separately.
+  const ghostRef    = useRef(new Map());
+
+  // Permanent set of every ID ever counted — survives ghost expiry
+  const countedIds  = useRef(new Set());
+
+  const nextId      = useRef(0);
+  const frameCount  = useRef(0);
 
   const [totalCount,  setTotalCount]  = useState(0);
   const [justCounted, setJustCounted] = useState(false);
@@ -201,66 +165,21 @@ export default function PeopleCounter() {
   const [inFrame,     setInFrame]     = useState(0);
   const [ghosts,      setGhosts]      = useState(0);
   const [log,         setLog]         = useState([]);
-  const [backendOnline, setBackendOnline] = useState(true);
-  const [sessionTime,   setSessionTime]   = useState(0); // seconds elapsed
-
-  // ── Session timer ─────────────────────────────────────────────────────────
-  useEffect(() => {
-    const timer = setInterval(() => setSessionTime(s => s + 1), 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const fmtTime = s => {
-    const h = String(Math.floor(s / 3600)).padStart(2, '0');
-    const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
-    const sec = String(s % 60).padStart(2, '0');
-    return `${h}:${m}:${sec}`;
-  };
 
   // ── Load model ──────────────────────────────────────────────────────────────
   useEffect(() => {
     let alive = true;
     (async () => {
-      // FIX (Issue #5): Use the module-level _loadPromise so the expensive TF
-      // download is shared across StrictMode remount cycles — never re-fetched.
-      if (!_loadPromise) {
-        _loadPromise = (async () => {
-          // Dynamic imports keep TF.js & COCO-SSD out of the initial JS bundle,
-          // cutting first-load payload from ~1.3 MB to a few KB.
-          const tf      = await import('@tensorflow/tfjs');
-          const cocoSsd = await import('@tensorflow-models/coco-ssd');
-          // FIX: Explicitly select a backend so we don't silently fall back to
-          // CPU. WebGL gives 10-20× faster inference on most devices.
-          try {
-            await tf.setBackend('webgl');
-          } catch {
-            console.warn('[TF] WebGL unavailable, falling back to CPU backend');
-            await tf.setBackend('cpu');
-          }
-          await tf.ready();
-          return await cocoSsd.load({ base: 'mobilenet_v2' });
-        })();
-      }
-      
-      try {
-        const model = await _loadPromise;
-        if (!alive) return;
-        modelRef.current = model;
-        setModelReady(true);
-      } catch (err) {
-        console.error("Error loading model:", err);
-      }
+      await tf.ready();
+      if (!alive) return;
+      modelRef.current = await cocoSsd.load({ base: 'mobilenet_v2' });
+      setModelReady(true);
     })();
-    return () => {
-      alive = false;
-      cancelAnimationFrame(rafRef.current);
-    };
+    return () => { alive = false; cancelAnimationFrame(rafRef.current); };
   }, []);
 
   // ── Detection loop ──────────────────────────────────────────────────────────
   const detect = useCallback(async () => {
-    if (isDetectingRef.current) return;
-    
     const model  = modelRef.current;
     const webcam = webcamRef.current;
     const canvas = canvasRef.current;
@@ -270,35 +189,28 @@ export default function PeopleCounter() {
     const vW = video.videoWidth, vH = video.videoHeight;
     if (!vW || !vH) return;
 
-    isDetectingRef.current = true;
-
-    try {
-      // BUG FIX: Track whether webcam is currently mirrored for coordinate correction
-    const isMirrored = facing === 'user';
-
     canvas.width = vW; canvas.height = vH;
     const diagLen   = Math.hypot(vW, vH);
     const ghostDist = diagLen * GHOST_RATIO;
+    const frame     = ++frameCount.current;
 
     // ── 1. Detect persons only ─────────────────────────────────────────────
-    // Pass MAX_DETECTIONS so COCO-SSD returns up to 30 boxes (default is only 20)
-    const raw = await model.detect(video, MAX_DETECTIONS);
+    const raw = await model.detect(video);
     const dets = applyNMS(
       raw.filter(
         p =>
           typeof p.class === 'string' &&
           p.class.trim().toLowerCase() === 'person' &&
           p.score >= CONFIDENCE &&
-          p.bbox[2] > 15 &&   // allow narrower boxes (partially visible)
-          p.bbox[3] > 30      // allow shorter boxes (far-away/seated people)
+          p.bbox[2] > 20 &&
+          p.bbox[3] > 40
       )
     ).map(p => {
       const [x, y, w, h] = p.bbox;
       return {
         cx: x + w / 2,
         cy: y + h / 2,
-        box: p.bbox,
-        score: p.score
+        box: p.bbox
       };
     });
 
@@ -308,11 +220,8 @@ export default function PeopleCounter() {
     const ghost  = ghostRef.current;
 
     // ── 2. Expire old ghosts ───────────────────────────────────────────────
-    // FIX: Compare real timestamps so ghost TTL is always exactly 3 minutes
-    // regardless of how fast or slow the detection loop is running.
-    const nowMs = Date.now();
     for (const [id, g] of ghost) {
-      if (nowMs - g.ghostedAt > GHOST_TTL_MS) ghost.delete(id);
+      if (frame - g.frame > GHOST_TTL) ghost.delete(id);
     }
 
     // ── 3. Match dets → active tracks (2-pass) ─────────────────────────────
@@ -324,81 +233,44 @@ export default function PeopleCounter() {
     );
 
     // ── 4. Update matched tracks ───────────────────────────────────────────
+    const newlyCounted = [];
     for (const [id, det] of [...pass1.matched, ...pass2.matched]) {
       const prev     = active.get(id);
       const appeared = (prev.appeared || 0) + 1;
+      const alreadyCounted = !!prev.counted;
 
       const updatedTrack = { ...prev, cx: det.cx, cy: det.cy, box: det.box, appeared, disappeared: 0 };
 
-      // We need Face-ID if we don't have one, or if we currently only have a Local fallback ID
-      // BUG FIX: Don't use !prev.personId because 0 is falsy in JS!
-      const needsFaceId = prev.personId === undefined || prev.personId === null || prev.localOnly;
-      const now = Date.now();
-      const timeSinceLastIdentify = now - (prev.lastIdentifyAttempt || 0);
-
-      // Try Face-ID if stable, and at least 1500ms has passed since last attempt
-      if (needsFaceId && appeared >= MIN_FRAMES && timeSinceLastIdentify > 1500) {
+      // If they have been stable for MIN_FRAMES, are NOT counted, and are NOT currently being identified
+      if (!alreadyCounted && appeared >= MIN_FRAMES) {
         // Safety: if identifying has been stuck for too long, force-release it
-        if (prev.identifying && prev.identifyStartTime && (now - prev.identifyStartTime > IDENTIFY_TIMEOUT)) {
+        if (prev.identifying && prev.identifyStartTime && (Date.now() - prev.identifyStartTime > IDENTIFY_TIMEOUT)) {
           updatedTrack.identifying = false;
         }
 
         if (!updatedTrack.identifying) {
           // Mark as identifying so we don't trigger multiple requests
           updatedTrack.identifying = true;
-          updatedTrack.identifyStartTime = now;
-          updatedTrack.lastIdentifyAttempt = now;
+          updatedTrack.identifyStartTime = Date.now();
           active.set(id, updatedTrack);
 
-          // Asynchronously ask backend (with isMirrored fix)
-          identifyPerson(video, det.box, isMirrored).then(result => {
+          // Asynchronously ask backend
+          identifyPerson(video, det.box).then(result => {
             const currentActive = activeRef.current;
             const currentTrack = currentActive.get(id);
 
             // ── CASE 1: Backend returned a valid person ID ──
-            if (result && result.id !== null && result.id !== undefined && result.status !== 'offline') {
-              setBackendOnline(true);
+            if (result && result.id !== null && result.id !== undefined) {
               const backendId = result.id;
-              const isRecognized = result.status === 'recognized';
 
               if (currentTrack) {
-                const wasLocalOnly = currentTrack.localOnly;
-                
                 currentActive.set(id, {
                   ...currentTrack,
                   personId: backendId,
                   counted: true,
                   identifying: false,
-                  reidentified: isRecognized,
-                  localOnly: false // Upgraded to proper Face-ID!
+                  reidentified: result.status === 'recognized'
                 });
-
-                // If they were previously counted as Local, but they are actually an old returning person:
-                // We overcounted them locally. We must decrement the total count!
-                if (wasLocalOnly && isRecognized) {
-                  setTotalCount(n => Math.max(0, n - 1));
-                  const t = new Date().toLocaleTimeString('en-US', { hour12: false });
-                  setLog(prevLogs => [{ id: backendId, t, source: 'face-id', note: '(merged from local)' }, ...prevLogs].slice(0, 50));
-                }
-
-                // If this is a BRAND NEW person (not seen before in Face-ID db):
-                if (!countedIds.current.has(backendId)) {
-                  countedIds.current.add(backendId);
-                  
-                  if (!wasLocalOnly) {
-                    // They weren't counted yet. Increment count!
-                    setTotalCount(n => n + 1);
-                    setJustCounted(true);
-                    clearTimeout(countAnimRef.current);
-                    countAnimRef.current = setTimeout(() => setJustCounted(false), 700);
-                    const t = new Date().toLocaleTimeString('en-US', { hour12: false });
-                    setLog(prevLogs => [{ id: backendId, t, source: 'face-id' }, ...prevLogs].slice(0, 50));
-                  } else {
-                    // They were ALREADY counted locally. Count stays the same, just log the upgrade.
-                    const t = new Date().toLocaleTimeString('en-US', { hour12: false });
-                    setLog(prevLogs => [{ id: backendId, t, source: 'face-id', note: '(upgraded to face-id)' }, ...prevLogs].slice(0, 50));
-                  }
-                }
               } else {
                 // They became a ghost while we were identifying
                 const ghostRegistry = ghostRef.current;
@@ -408,113 +280,43 @@ export default function PeopleCounter() {
                     ...g,
                     personId: backendId,
                     counted: true,
-                    reidentified: isRecognized,
-                    localOnly: false
+                    reidentified: result.status === 'recognized'
                   });
                 }
               }
 
-            // ── CASE 2: Backend offline ──
-            } else if (result && result.status === 'offline') {
-              setBackendOnline(false);
-              if (currentTrack) {
-                if (!currentTrack.counted) {
-                  // FALLBACK: Count them locally if the backend is dead and they haven't been counted
-                  const localId = localNextPersonId.current++;
-                  currentActive.set(id, {
-                    ...currentTrack,
-                    personId: localId,
-                    counted: true,
-                    identifying: false,
-                    localOnly: true // Mark as a local fallback
-                  });
-                  
-                  // Add to total count
-                  setTotalCount(n => n + 1);
-                  setJustCounted(true);
-                  clearTimeout(countAnimRef.current);
-                  countAnimRef.current = setTimeout(() => setJustCounted(false), 700);
-                  
-                  const t = new Date().toLocaleTimeString('en-US', { hour12: false });
-                  setLog(prevLogs => [{ id: localId, t, source: 'local', note: '(backend offline)' }, ...prevLogs].slice(0, 50));
-                } else {
-                  // They were already counted locally, just reset identifying flag so we don't spam the offline backend
-                  currentActive.set(id, { ...currentTrack, identifying: false });
-                }
+              // ONLY increment count if this is a BRAND NEW person from the backend
+              if (!countedIds.current.has(backendId)) {
+                countedIds.current.add(backendId);
+                setTotalCount(n => n + 1);
+                setJustCounted(true);
+                clearTimeout(window.countAnimTimeout);
+                window.countAnimTimeout = setTimeout(() => setJustCounted(false), 700);
+                const t = new Date().toLocaleTimeString('en-US', { hour12: false });
+                setLog(prevLogs => [{ id: backendId, t }, ...prevLogs].slice(0, 15));
               }
+              // If already counted (recognized), do NOT increment — just update the track silently
 
-            // ── CASE 3: Backend said "no_face" or timed out ──
+            // ── CASE 2: Backend said "no_face" or returned null ──
+            // Do NOT count them. Just reset the flag so we can try again next cycle.
             } else {
               if (currentTrack) {
-                const attempts = (currentTrack.noFaceAttempts || 0) + 1;
-                if (!currentTrack.counted && attempts >= MAX_NO_FACE_ATTEMPTS) {
-                  // Person has been in frame multiple times but face never detected.
-                  // Count them locally so they are never missed.
-                  const localId = localNextPersonId.current++;
-                  currentActive.set(id, {
-                    ...currentTrack,
-                    personId: localId,
-                    counted: true,
-                    identifying: false,
-                    noFaceAttempts: 0,
-                    localOnly: true
-                  });
-                  setTotalCount(n => n + 1);
-                  setJustCounted(true);
-                  clearTimeout(countAnimRef.current);
-                  countAnimRef.current = setTimeout(() => setJustCounted(false), 700);
-                  const t = new Date().toLocaleTimeString('en-US', { hour12: false });
-                  setLog(prevLogs => [{ id: localId, t, source: 'local', note: '(counted after retry)' }, ...prevLogs].slice(0, 50));
-                } else {
-                  // Still has attempts left — retry identify after a short delay
-                  currentActive.set(id, { ...currentTrack, identifying: false, noFaceAttempts: attempts });
-                }
+                currentActive.set(id, { ...currentTrack, identifying: false });
               }
             }
           }).catch(() => {
-            // Network error or timeout — treat like a no_face attempt
+            // ── CASE 3: Network error ──
+            // Do NOT count. Just reset the flag so we retry.
             const currentTrack = activeRef.current.get(id);
             if (currentTrack) {
-              const attempts = (currentTrack.noFaceAttempts || 0) + 1;
-              if (!currentTrack.counted && attempts >= MAX_NO_FACE_ATTEMPTS) {
-                const localId = localNextPersonId.current++;
-                activeRef.current.set(id, {
-                  ...currentTrack,
-                  personId: localId,
-                  counted: true,
-                  identifying: false,
-                  noFaceAttempts: 0,
-                  localOnly: true
-                });
-                setTotalCount(n => n + 1);
-                setJustCounted(true);
-                clearTimeout(countAnimRef.current);
-                countAnimRef.current = setTimeout(() => setJustCounted(false), 700);
-                const t = new Date().toLocaleTimeString('en-US', { hour12: false });
-                setLog(prevLogs => [{ id: localId, t, source: 'local', note: '(timeout fallback)' }, ...prevLogs].slice(0, 50));
-              } else {
-                activeRef.current.set(id, { ...currentTrack, identifying: false, noFaceAttempts: attempts });
-              }
+              activeRef.current.set(id, { ...currentTrack, identifying: false });
             }
           });
-          // FIX (Issue #4): Guard clause instead of 'continue' — the identify
-          // call was already fired above; skip the track update below so we
-          // don't overwrite the identifying=true state we just set.
-          // The previous pattern (fire-then-continue) worked but was confusing
-          // because the 'continue' appeared to be inside the .then() callback.
-        } else {
-          // Already identifying — update position only, leave identifying=true
-          active.set(id, updatedTrack);
+          continue;
         }
-      } else {
-        // Outer else: needsFaceId=false (already counted), OR appeared < MIN_FRAMES,
-        // OR within 1500ms cooldown. We MUST write updatedTrack in all these cases
-        // so the 'appeared' counter keeps incrementing each frame.
-        // Without this line the track is frozen and identify never triggers.
-        active.set(id, updatedTrack);
       }
-      // Note: tracks where identifying was fired are NOT written here;
-      // their state is managed exclusively inside the .then()/.catch() above.
+      
+      active.set(id, updatedTrack);
     }
 
     // ── 5. Unmatched active tracks: age or ghost ───────────────────────────
@@ -528,7 +330,7 @@ export default function PeopleCounter() {
       const disappeared = t.disappeared + 1;
       if (disappeared > MAX_DISAPPEARED) {
         // Move to ghost registry so re-entry is matched back to same ID
-        ghost.set(id, { ...t, ghostedAt: Date.now() });
+        ghost.set(id, { ...t, frame });
         active.delete(id);
       } else {
         active.set(id, { ...t, disappeared });
@@ -572,9 +374,6 @@ export default function PeopleCounter() {
           box: det.box,
           appeared: MIN_FRAMES,
           disappeared: 0,
-          // If this person was already counted, mark as re-identified so the badge
-          // immediately shows 'Already Detected' on re-entry, without waiting for Face-ID.
-          reidentified: revivedTrack.counted ? true : revivedTrack.reidentified,
         });
 
         continue;
@@ -617,8 +416,7 @@ export default function PeopleCounter() {
         appeared: 1,
         disappeared: 0,
         counted: false,
-        identifying: false,
-        noFaceAttempts: 0
+        identifying: false
       });
     }
 
@@ -634,15 +432,7 @@ export default function PeopleCounter() {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, vW, vH);
 
-    // BUG FIX: Mirror the canvas context when webcam is in selfie mode.
-    // The <Webcam mirrored> prop only applies CSS scaleX(-1) to the <video>
-    // element — the raw pixel coordinates from COCO-SSD are NOT flipped.
-    // We must flip the canvas drawing context to match what the user sees.
-    if (isMirrored) {
-      ctx.save();
-      ctx.translate(vW, 0);
-      ctx.scale(-1, 1);
-    }
+    const isMirrored = facing === 'user';
 
     // Ghost rings (faint purple dots)
     for (const [, g] of ghost) {
@@ -651,13 +441,14 @@ export default function PeopleCounter() {
       ctx.lineWidth = 1.5;
       ctx.setLineDash([3, 5]);
       ctx.beginPath();
-      ctx.arc(g.cx, g.cy, 20, 0, Math.PI * 2);
+      const drawCx = isMirrored ? vW - g.cx : g.cx;
+      ctx.arc(drawCx, g.cy, 20, 0, Math.PI * 2);
       ctx.stroke();
       ctx.restore();
     }
 
     // Active tracks
-    for (const [, track] of active) {
+    for (const [id, track] of active) {
       const { cx, cy, box, appeared, counted, disappeared, identifying } = track;
       const [bx, by, bw, bh] = box;
       if (disappeared >= MAX_DISAPPEARED) continue;
@@ -665,105 +456,53 @@ export default function PeopleCounter() {
       const fade  = disappeared === 0 ? 1 : Math.max(0.2, 1 - disappeared / MAX_DISAPPEARED);
       const color = counted ? `rgba(0,230,180,${fade})` : `rgba(255,190,50,${fade})`;
 
+      const drawBx = isMirrored ? vW - bx - bw : bx;
+      const drawCx = isMirrored ? vW - cx : cx;
+
       // Box
       ctx.save();
       ctx.strokeStyle = color;
       ctx.lineWidth   = 2.5;
       ctx.shadowColor = color;
       ctx.shadowBlur  = 14;
-      ctx.strokeRect(bx, by, bw, bh);
+      ctx.strokeRect(drawBx, by, bw, bh);
       ctx.restore();
 
       // Scan progress bar (while not yet counted)
-      // FIX (Issue #6): Three distinct visual states:
-      //   1. Scanning  (appeared < MIN_FRAMES): bar fills left→right
-      //   2. Identifying (appeared >= MIN_FRAMES, backend pending): pulsing shimmer
-      //   3. Counted: bar hidden
       if (!counted) {
+        const pct = Math.min(appeared / MIN_FRAMES, 1);
         ctx.save();
-        // Background track
         ctx.fillStyle = 'rgba(255,190,50,0.12)';
-        ctx.fillRect(bx, by + bh - 5, bw, 5);
-
-        if (!identifying) {
-          // Phase 1 — filling progress bar
-          const pct = Math.min(appeared / MIN_FRAMES, 1);
-          ctx.fillStyle = '#ffbe32';
-          ctx.fillRect(bx, by + bh - 5, bw * pct, 5);
-        } else {
-          // Phase 2 — pulsing shimmer: a bright segment sweeps back and forth
-          const t = (Date.now() % 1200) / 1200;          // 0 → 1 in 1.2 s
-          const ping = Math.abs(Math.sin(t * Math.PI)); // 0→1→0 (ping-pong)
-          const seg  = bw * 0.4;                         // shimmer width = 40% of box
-          const startX = bx + (bw - seg) * ping;
-          ctx.fillStyle = 'rgba(100,200,255,0.7)';
-          ctx.fillRect(startX, by + bh - 5, seg, 5);
-        }
+        ctx.fillRect(drawBx, by + bh - 5, bw, 5);
+        ctx.fillStyle = '#ffbe32';
+        ctx.fillRect(drawBx, by + bh - 5, bw * pct, 5);
         ctx.restore();
       }
 
       // Centroid dot
       ctx.save();
       ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 10;
-      ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(drawCx, cy, 5, 0, Math.PI * 2); ctx.fill();
       ctx.restore();
 
-      // ID badge — BUG FIX: When mirrored, text would render backwards.
-      // We temporarily un-flip for text rendering by saving/restoring context.
-      if (isMirrored) {
-        ctx.save();
-        ctx.scale(-1, 1);
-        ctx.translate(-vW, 0);
-        const flippedBx = vW - bx - bw;
-        let label = `⏳ Scanning...`;
-        if (counted) {
-          const pId = track.personId !== undefined ? track.personId : '?';
-          const displayId = track.localOnly ? `L-${pId - 10000}` : `${pId}`;
-          if (track.reidentified) {
-            label = `↩ Already Detected (ID ${displayId})`;
-          } else if (track.localOnly) {
-            label = disappeared > 0 ? `↩ ID ${displayId} ⚡` : `✓ ID ${displayId} ⚡`;
-          } else {
-            label = disappeared > 0 ? `↩ Already Detected (ID ${displayId})` : `✓ ID ${displayId}`;
-          }
-        } else if (identifying) {
-          label = `🔍 Identifying...`;
+      // ID badge
+      let label = `⏳ Scanning...`;
+      if (counted) {
+        const pId = track.personId !== undefined ? track.personId : '?';
+        if (track.reidentified) {
+          label = `↩ ALREADY DETECTED (ID ${pId})`;
+        } else {
+          label = disappeared > 0 ? `↩ ID ${pId}` : `✓ ID ${pId}`;
         }
-        const badgeC = counted
-          ? `rgba(0,230,180,${Math.max(0.8, fade)})`
-          : `rgba(255,190,50,${Math.max(0.8, fade)})`;
-        drawBadge(ctx, flippedBx, by - 28, label, badgeC);
-        ctx.restore();
-      } else {
-        let label = `⏳ Scanning...`;
-        if (counted) {
-          const pId = track.personId !== undefined ? track.personId : '?';
-          const displayId = track.localOnly ? `L-${pId - 10000}` : `${pId}`;
-          if (track.reidentified) {
-            label = `↩ Already Detected (ID ${displayId})`;
-          } else if (track.localOnly) {
-            label = disappeared > 0 ? `↩ ID ${displayId} ⚡` : `✓ ID ${displayId} ⚡`;
-          } else {
-            label = disappeared > 0 ? `↩ Already Detected (ID ${displayId})` : `✓ ID ${displayId}`;
-          }
-        } else if (identifying) {
-          label = `🔍 Identifying...`;
-        }
-        const badgeC = counted
-          ? `rgba(0,230,180,${Math.max(0.8, fade)})`
-          : `rgba(255,190,50,${Math.max(0.8, fade)})`;
-        drawBadge(ctx, bx, by - 28, label, badgeC);
+      } else if (identifying) {
+        label = `🔍 Identifying face...`;
       }
+      const badgeC = counted
+        ? `rgba(0,230,180,${Math.max(0.8, fade)})`
+        : `rgba(255,190,50,${Math.max(0.8, fade)})`;
+      drawBadge(ctx, drawBx, by - 28, label, badgeC);
     }
-
-    // BUG FIX: Restore context if we flipped it for mirrored mode
-    if (isMirrored) {
-      ctx.restore();
-    }
-    } finally {
-      isDetectingRef.current = false;
-    }
-  }, [facing]);
+  }, []);
 
   // ── RAF loop ────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -780,18 +519,11 @@ export default function PeopleCounter() {
 
   // ── Reset ───────────────────────────────────────────────────────────────────
   const handleReset = () => {
-    // Clear in-component refs AND the module-level singletons so they stay in
-    // sync — a remount after reset must not see stale singleton data.
-    activeRef.current.clear();    _active.clear();
-    ghostRef.current.clear();     _ghost.clear();
-    countedIds.current.clear();   _countedIds.clear();
-    nextId.current = 0;           _nextId = 0;
-    // FIX: Reset to 10000, not 0 — preserves the offset guard that prevents
-    // local fallback IDs from colliding with backend Face-IDs (0, 1, 2…).
-    localNextPersonId.current = 10000;  _localNextId = 10000;
-    // FIX: Clear the animation timer ref on reset to avoid stale callbacks.
-    clearTimeout(countAnimRef.current);
-    countAnimRef.current = null;
+    activeRef.current.clear();
+    ghostRef.current.clear();
+    countedIds.current.clear();
+    nextId.current = 0;
+    frameCount.current = 0;
     setTotalCount(0);
     setInFrame(0);
     setGhosts(0);
@@ -802,7 +534,7 @@ export default function PeopleCounter() {
     // Also clear the Python DeepFace face database
     fetch('/api/reset', { method: 'POST' })
       .then(() => console.log('Backend face database cleared!'))
-      .catch(err => console.warn('Could not reset backend (offline?):', err));
+      .catch(err => console.warn('Could not reset backend:', err));
   };
 
   const toggleCamera = () => {
@@ -812,10 +544,6 @@ export default function PeopleCounter() {
   };
 
   // ── Render ──────────────────────────────────────────────────────────────────
-  // Compute ring stroke offset (440 = full circumference for r=70)
-  // Fill from 0 up to max 50 people; cap at 440 (full circle)
-  const ringOffset = Math.max(0, 440 - Math.min(totalCount / 50, 1) * 440);
-
   return (
     <div className="pc-root">
       <header className="pc-header">
@@ -827,11 +555,6 @@ export default function PeopleCounter() {
           </div>
         </div>
         <div className="pc-header-right">
-          {/* Session timer */}
-          <div className="pc-session-badge">
-            <span style={{fontSize:'0.7rem', color:'var(--text-muted)'}}>⏱</span>
-            <span className="pc-session-time">{fmtTime(sessionTime)}</span>
-          </div>
           <div className="pc-stat-mini">
             <span className="pc-stat-mini-val">{inFrame}</span>
             <span className="pc-stat-mini-label">In Frame</span>
@@ -840,13 +563,9 @@ export default function PeopleCounter() {
             <span className="pc-stat-mini-val">{ghosts}</span>
             <span className="pc-stat-mini-label">Memory</span>
           </div>
-          <div className={`pc-status-pill ${backendOnline ? '' : 'pc-status-offline'}`}>
-            <span className={`pc-dot ${backendOnline ? 'active' : 'offline-dot'}`} />
-            {backendOnline ? 'Face-ID Active' : 'Local Mode ⚡'}
-          </div>
           <div className="pc-status-pill">
             <span className={`pc-dot ${modelReady ? 'active' : 'loading'}`} />
-            {modelReady ? 'AI Ready' : 'Loading…'}
+            {modelReady ? 'Model Ready' : 'Loading…'}
           </div>
         </div>
       </header>
@@ -866,28 +585,14 @@ export default function PeopleCounter() {
                 className="pc-webcam"
                 audio={false}
                 mirrored={facing === 'user'}
-                videoConstraints={{ facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }}
+                videoConstraints={{ facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }}
                 onUserMediaError={() => setCamError(true)}
               />
               <canvas ref={canvasRef} className="pc-canvas" />
-              {/* Scan-line texture */}
-              <div className="pc-camera-scanline" />
-              {/* Moving scan bar */}
-              {modelReady && <div className="pc-camera-scanbar" />}
-              {/* Extra corner brackets */}
-              <div className="pc-corner-tr" />
-              <div className="pc-corner-bl" />
-              {/* REC badge */}
-              {modelReady && (
-                <div className="pc-rec-badge">
-                  <span className="pc-rec-dot" />
-                  LIVE
-                </div>
-              )}
               {!modelReady && (
                 <div className="pc-overlay-loading">
                   <div className="pc-spinner" />
-                  <p className="pc-loading-title">Initializing AI Engine</p>
+                  <p className="pc-loading-title">Initializing TensorFlow.js</p>
                   <p className="pc-loading-sub">Loading COCO-SSD model… ~10 s on first load</p>
                 </div>
               )}
@@ -896,26 +601,10 @@ export default function PeopleCounter() {
         </div>
 
         <aside className="pc-panel">
-          {/* Count card with SVG ring */}
+          {/* Count card */}
           <div className={`pc-card pc-count-card ${justCounted ? 'counted-anim' : ''}`}>
             <p className="pc-card-label">Total Unique People</p>
-            <div className="pc-count-ring">
-              <svg viewBox="0 0 160 160" xmlns="http://www.w3.org/2000/svg">
-                <defs>
-                  <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="0%">
-                    <stop offset="0%" stopColor="#00f2fe" />
-                    <stop offset="100%" stopColor="#4facfe" />
-                  </linearGradient>
-                </defs>
-                <circle className="pc-count-ring-track" cx="80" cy="80" r="70" />
-                <circle
-                  className="pc-count-ring-fill"
-                  cx="80" cy="80" r="70"
-                  style={{ strokeDashoffset: ringOffset }}
-                />
-              </svg>
-              <div className="pc-count-display">{totalCount}</div>
-            </div>
+            <div className="pc-count-display">{totalCount}</div>
             <p className="pc-card-hint">Each person counted exactly once — even on re-entry</p>
           </div>
 
@@ -943,12 +632,8 @@ export default function PeopleCounter() {
               <ul className="pc-log-list">
                 {log.map((entry, i) => (
                   <li key={`${entry.id}-${i}`} className={`pc-log-item ${i === 0 ? 'pc-log-latest' : ''}`}>
-                    <span className="pc-log-check">{entry.source === 'local' ? '⚡' : '✓'}</span>
-                    <span className="pc-log-text">
-                      Person <strong>ID {entry.id}</strong> counted
-                      {entry.source === 'local' && <span className="pc-log-local"> (local)</span>}
-                      {entry.note && <span style={{fontSize:'0.65rem',color:'var(--text-dim)',marginLeft:4}}>{entry.note}</span>}
-                    </span>
+                    <span className="pc-log-check">✓</span>
+                    <span className="pc-log-text">Person <strong>ID {entry.id}</strong> counted</span>
                     <span className="pc-log-time">{entry.t}</span>
                   </li>
                 ))}
@@ -960,8 +645,8 @@ export default function PeopleCounter() {
           <div className="pc-card pc-legend">
             <p className="pc-card-label">Canvas Legend</p>
             <ul className="pc-legend-list">
-              <li><span className="legend-swatch teal" />Counted person</li>
-              <li><span className="legend-swatch amber" />Scanning — confirming</li>
+              <li><span className="legend-swatch teal" />Counted <code>✓ ID</code></li>
+              <li><span className="legend-swatch amber" />Scanning — confirming person</li>
               <li><span className="legend-swatch purple" />Ghost memory position</li>
             </ul>
           </div>
@@ -969,7 +654,7 @@ export default function PeopleCounter() {
           {/* Controls */}
           <div className="pc-card pc-controls">
             <p className="pc-card-label">Controls</p>
-            <button className="pc-btn pc-btn-danger"    onClick={handleReset}>🔄 Reset Count &amp; Memory</button>
+            <button className="pc-btn pc-btn-danger"    onClick={handleReset}>🔄 Reset Count</button>
             <button className="pc-btn pc-btn-secondary" onClick={toggleCamera}>🔁 Switch Camera</button>
           </div>
 
@@ -977,11 +662,11 @@ export default function PeopleCounter() {
           <div className="pc-card pc-info">
             <p className="pc-card-label">How It Works</p>
             <ol className="pc-info-list">
-              <li><strong>Person-only:</strong> COCO-SSD detects bodies with ≥35% confidence.</li>
-              <li><strong>NMS:</strong> Overlapping boxes collapsed to one per body.</li>
-              <li><strong>2-pass tracking:</strong> Tight then wide centroid matching per frame.</li>
-              <li><strong>Ghost memory:</strong> People remembered for ~3 min after leaving.</li>
-              <li><strong>Face-ID:</strong> DeepFace backend provides identity across sessions.</li>
+              <li><strong>Person-only:</strong> COCO-SSD "person" class ≥ 50% confidence only — all objects ignored.</li>
+              <li><strong>NMS:</strong> Overlapping / nested boxes collapsed to one per body.</li>
+              <li><strong>2-pass matching:</strong> Tight then wide centroid matching per frame.</li>
+              <li><strong>Ghost memory:</strong> People who exit are remembered for 30 s; re-matched on return — never re-counted.</li>
+              <li><strong>Unlimited scale:</strong> Handles 100+ unique people. Each gets a permanent unique ID.</li>
             </ol>
           </div>
         </aside>

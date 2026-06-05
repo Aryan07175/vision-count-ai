@@ -1,0 +1,16 @@
+VisionCount AI - Mirroring, Aspect Ratio, and Crop Fixes
+
+This branch resolves visual and backend face-cropping bugs:
+
+1. Canvas Mirroring Overlay Alignment (src/components/PeopleCounter.jsx)
+   - Bounding boxes, centroids, and ghost memory indicators now horizontally flip coordinates in mirrored camera mode (facingMode === 'user').
+   - Drawing coordinates are calculated using (videoWidth - x - width) to align exactly with the mirrored browser webcam display.
+   - Text badges are drawn normally and remain readable (not horizontally flipped backwards).
+
+2. Canvas Aspect Ratio Scaling Match (src/components/PeopleCounter.css)
+   - Added 'object-fit: cover' to the canvas element selector to match the webcam element.
+   - Ensures correct alignment when resolutions or aspect ratios (like 4:3 native camera stream) differ from the 16:9 container aspect ratio.
+
+3. Clamped and Safe Face Cropping (src/components/PeopleCounter.jsx)
+   - Bounding box coordinates are clamped within the video dimensions before cropping.
+   - Replaced negative offsets with standard 9-parameter canvas drawImage call to prevent rendering errors.
