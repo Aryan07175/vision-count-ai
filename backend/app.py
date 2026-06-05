@@ -6,19 +6,24 @@ import hashlib
 import time
 import threading
 
-# Fix Windows encoding issues — DeepFace logs Unicode that 'charmap' can't handle
+# Fix Windows encoding issues — DeepFace logs Unicode that
+# 'charmap' can't handle
 if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer, encoding='utf-8', errors='replace'
+    )  # type: ignore
+    sys.stderr = io.TextIOWrapper(
+        sys.stderr.buffer, encoding='utf-8', errors='replace'
+    )  # type: ignore
     os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import base64
-import cv2
+import cv2  # type: ignore
 import numpy as np
-from deepface import DeepFace
+from deepface import DeepFace  # type: ignore
 from typing import Dict, List
 from collections import OrderedDict
 from fastapi.staticfiles import StaticFiles
@@ -26,8 +31,7 @@ from fastapi.responses import FileResponse
 
 app = FastAPI()
 
-# ─── API Router for Backend Routes ─────────────────────────────────────────────
-from fastapi import APIRouter
+# ─── API Router for Backend Routes ───────────────────────────────────────
 api_router = APIRouter(prefix="/api")
 FRONTEND_ORIGINS = [
     origin.strip()
@@ -47,19 +51,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── In-memory storage for known face embeddings ───────────────────────────────
-# Format: { id: { "embeddings": [...], "first_seen": timestamp, "last_seen": timestamp } }
+# ─── In-memory storage for known face embeddings ─────────────────────────
+# Format: { id: { "embeddings": [...], "first_seen": ts, "last_seen": ts } }
 known_faces: Dict[int, dict] = {}
 next_id = 0
 
-# ─── LRU Result Cache ──────────────────────────────────────────────────────────
-# Avoids redundant DeepFace calls for the same image (same person in same position).
+# ─── LRU Result Cache ────────────────────────────────────────────────────
+# Avoids redundant DeepFace calls for the same image (same person/position).
 # Key = SHA256 of the raw image bytes. Value = {"result": ..., "ts": timestamp}
 MAX_CACHE_SIZE = 200
-CACHE_TTL_SECS = 4  # cache entries valid for 4 seconds only (live video changes fast)
+CACHE_TTL_SECS = 4  # cache entries valid for 4 seconds only
 _result_cache: OrderedDict = OrderedDict()
 
-# ─── Concurrency lock ──────────────────────────────────────────────────────────
+# ─── Concurrency lock ────────────────────────────────────────────────────
 # Prevents multiple simultaneous DeepFace calls which would thrash the CPU.
 _inference_lock = asyncio.Lock()
 
@@ -67,24 +71,26 @@ _inference_lock = asyncio.Lock()
 # threading.Lock to prevent two simultaneous requests getting the same ID.
 _id_lock = threading.Lock()
 
-# ─── Tuning constants ──────────────────────────────────────────────────────────
+# ─── Tuning constants ────────────────────────────────────────────────────
 # Cosine distance benchmarks for Facenet512 (lower = more similar):
 #   Same person, same angle:        0.00 – 0.18
 #   Same person, different angle:   0.18 – 0.28
 #   Different people, similar look: 0.30 – 0.40
 #   Clearly different people:       0.40+
-#
 # FIX: was 0.40 — far too loose, causing different people to match the same ID.
 # 0.30 sits well inside the "different people" zone for Facenet512.
-THRESHOLD = 0.30
+# Update: 0.30 is too strict for different angles of the same person.
+# Loosening to 0.40 to ensure the same person is matched when they return.
+THRESHOLD = 0.40
 
-# FIX: Margin guard — the best match must be this much BETTER than the second-best
-# candidate. If two stored people are almost equally close, the match is ambiguous
-# and we reject it to avoid giving the wrong ID.
-MATCH_MARGIN = 0.07
+# FIX: Margin guard — the best match must be this much BETTER than the
+# second-best candidate. If two stored people are almost equally close,
+# the match is ambiguous and we reject it to avoid giving the wrong ID.
+# Update: 0.07 is too strict, reducing to 0.04 to allow close matches.
+MATCH_MARGIN = 0.04
 
 # Minimum confidence area for a face detection to be trusted
-MIN_FACE_AREA = 800  # pixels² — raised slightly; tiny face crops produce noisy embeddings
+MIN_FACE_AREA = 800  # pixels² — raised slightly to avoid noisy embeddings
 
 # Max embeddings stored per person (memory of their different angles)
 MAX_EMBEDDINGS_PER_PERSON = 12
@@ -118,10 +124,10 @@ def preprocess_image(img: np.ndarray) -> np.ndarray:
     """
     # Convert to LAB colour space for CLAHE (adaptive histogram equalisation)
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+    l_channel, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    enhanced = cv2.merge((l, a, b))
+    l_channel = clahe.apply(l_channel)
+    enhanced = cv2.merge((l_channel, a, b))
     enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
     # Mild unsharp mask to sharpen edges (helps face detectors)
@@ -160,11 +166,11 @@ def find_best_match(embedding: List[float]) -> tuple:
         all_dists = sorted(
             cosine_distance(embedding, e) for e in data["embeddings"]
         )
-        # Use mean of up to 3 closest embeddings — far more stable than min()
-        # because it requires CONSISTENT similarity, not just one lucky match.
-        top_n = all_dists[:3]
-        mean_dist = sum(top_n) / len(top_n)
-        scores.append((mean_dist, person_id))
+        # Use the single best match (min distance). A person might match one
+        # stored angle perfectly but not the others. Averaging them would
+        # artificially inflate the distance and cause recognition failures.
+        best_single_dist = all_dists[0]
+        scores.append((best_single_dist, person_id))
 
     if not scores:
         return None, float('inf'), float('inf')
@@ -198,22 +204,20 @@ def cache_set(key: str, result: dict):
 
 @api_router.post("/identify")
 async def identify_person(payload: ImagePayload):
-    global next_id
-
     img, img_data = decode_image(payload.image_base64)
-    if img is None:
+    if img is None or img_data is None:
         raise HTTPException(status_code=400, detail="Invalid image data")
 
-    # ── 1. Cache lookup ────────────────────────────────────────────────────────
+    # ── 1. Cache lookup ──────────────────────────────────────────────────
     key = cache_key(img_data)
     cached = cache_get(key)
     if cached is not None:
         return cached
 
-    # ── 2. Preprocess ──────────────────────────────────────────────────────────
+    # ── 2. Preprocess ────────────────────────────────────────────────────
     img = preprocess_image(img)
 
-    # ── 3. Serialize DeepFace calls to prevent CPU overload ───────────────────
+    # ── 3. Serialize DeepFace calls to prevent CPU overload ──────────────
     async with _inference_lock:
         result = await asyncio.get_running_loop().run_in_executor(
             None, _run_deepface, img
@@ -227,7 +231,7 @@ def _run_deepface(img: np.ndarray) -> dict:
     """Synchronous DeepFace inference — runs in a thread executor."""
     global next_id
 
-    objs = None  # Initialize before loop so 'if not objs' works when all backends fail
+    objs = None  # Initialize before loop so 'if not objs' works
     for backend in DETECTOR_BACKENDS:
         try:
             objs = DeepFace.represent(
@@ -264,17 +268,27 @@ def _run_deepface(img: np.ndarray) -> dict:
         # Reject and treat as a new person to avoid assigning the wrong ID.
         margin = second_dist - best_dist
         if margin < MATCH_MARGIN:
-            print(f"[Ambiguous] best={best_dist:.3f} vs second={second_dist:.3f} "
-                  f"(margin={margin:.3f} < {MATCH_MARGIN}) — treating as new person")
-            # Fall through to new-person creation below
+            print(
+                f"[Ambiguous] best={best_dist:.3f} vs "
+                f"second={second_dist:.3f} (margin={margin:.3f} "
+                f"< {MATCH_MARGIN}) — retrying next frame"
+            )
+            return {"id": None, "status": "ambiguous", "distance": -1}
         else:
             # Known person — update their profile with this new embedding angle
             data = known_faces[best_id]
             data["last_seen"] = time.time()
             if len(data["embeddings"]) < MAX_EMBEDDINGS_PER_PERSON:
                 data["embeddings"].append(embedding)
-            print(f"[Match] ID {best_id} (dist={best_dist:.3f}, margin={margin:.3f})")
-            return {"id": best_id, "status": "recognized", "distance": float(best_dist)}
+            print(
+                f"[Match] ID {best_id} "
+                f"(dist={best_dist:.3f}, margin={margin:.3f})"
+            )
+            return {
+                "id": best_id,
+                "status": "recognized",
+                "distance": float(best_dist)
+            }
 
     # New person
     with _id_lock:
@@ -286,7 +300,10 @@ def _run_deepface(img: np.ndarray) -> dict:
         "last_seen": time.time(),
     }
     safe_dist = float(best_dist) if best_dist != float('inf') else -1.0
-    print(f"[New] Person assigned ID {new_id} (closest existing dist={safe_dist:.3f})")
+    print(
+        f"[New] Person assigned ID {new_id} "
+        f"(closest existing dist={safe_dist:.3f})"
+    )
     return {"id": new_id, "status": "new", "distance": safe_dist}
 
 
@@ -311,11 +328,13 @@ async def status():
 
 app.include_router(api_router)
 
-# ─── Mount React Frontend ──────────────────────────────────────────────────────
+# ─── Mount React Frontend ────────────────────────────────────────────────
 frontend_dist = os.path.join(os.path.dirname(__file__), '..', 'dist')
 if os.path.exists(frontend_dist):
-    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
-    
+    app.mount(
+        "/", StaticFiles(directory=frontend_dist, html=True), name="frontend"
+    )
+
     @app.exception_handler(404)
     async def custom_404_handler(request, exc):
         return FileResponse(os.path.join(frontend_dist, 'index.html'))

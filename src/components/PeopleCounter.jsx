@@ -105,12 +105,12 @@ async function identifyPerson(video, box) {
   const vW = video.videoWidth;
   const vH = video.videoHeight;
   
-  // Crop the head region (top 35% of the body bounding box)
-  // Clamp boundaries to prevent out-of-range dimensions
-  const cropX = Math.max(0, Math.min(x, vW - 1));
-  const cropY = Math.max(0, Math.min(y, vH - 1));
-  const cropW = Math.max(1, Math.min(w, vW - cropX));
-  const cropH = Math.max(1, Math.min(h * 0.35, vH - cropY));
+  // Crop the person's bounding box with a small margin for DeepFace to detect the face
+  const margin = Math.min(w, h) * 0.1;
+  const cropX = Math.max(0, x - margin);
+  const cropY = Math.max(0, y - margin);
+  const cropW = Math.min(vW - cropX, w + margin * 2);
+  const cropH = Math.min(vH - cropY, h + margin * 2);
 
   const canvas = document.createElement('canvas');
   canvas.width = cropW;
@@ -233,7 +233,6 @@ export default function PeopleCounter() {
     );
 
     // ── 4. Update matched tracks ───────────────────────────────────────────
-    const newlyCounted = [];
     for (const [id, det] of [...pass1.matched, ...pass2.matched]) {
       const prev     = active.get(id);
       const appeared = (prev.appeared || 0) + 1;
@@ -298,10 +297,31 @@ export default function PeopleCounter() {
               // If already counted (recognized), do NOT increment — just update the track silently
 
             // ── CASE 2: Backend said "no_face" or returned null ──
-            // Do NOT count them. Just reset the flag so we can try again next cycle.
             } else {
               if (currentTrack) {
-                currentActive.set(id, { ...currentTrack, identifying: false });
+                // Fallback: If we've tried to find a face for ~4.5 seconds and failed,
+                // we count them anyway as an 'Anon' person so the counter goes up.
+                if (!currentTrack.counted && currentTrack.appeared > 30) {
+                  const anonId = 'Anon-' + id.replace('tmp_', '');
+                  
+                  currentActive.set(id, {
+                    ...currentTrack,
+                    personId: anonId,
+                    counted: true,
+                    identifying: false,
+                    reidentified: false
+                  });
+                  
+                  setTotalCount(n => n + 1);
+                  setJustCounted(true);
+                  clearTimeout(window.countAnimTimeout);
+                  window.countAnimTimeout = setTimeout(() => setJustCounted(false), 700);
+                  const t = new Date().toLocaleTimeString('en-US', { hour12: false });
+                  setLog(prevLogs => [{ id: anonId, t }, ...prevLogs].slice(0, 15));
+                } else {
+                  // Keep trying
+                  currentActive.set(id, { ...currentTrack, identifying: false });
+                }
               }
             }
           }).catch(() => {
@@ -448,7 +468,7 @@ export default function PeopleCounter() {
     }
 
     // Active tracks
-    for (const [id, track] of active) {
+    for (const [, track] of active) {
       const { cx, cy, box, appeared, counted, disappeared, identifying } = track;
       const [bx, by, bw, bh] = box;
       if (disappeared >= MAX_DISAPPEARED) continue;
@@ -502,7 +522,7 @@ export default function PeopleCounter() {
         : `rgba(255,190,50,${Math.max(0.8, fade)})`;
       drawBadge(ctx, drawBx, by - 28, label, badgeC);
     }
-  }, []);
+  }, [facing]);
 
   // ── RAF loop ────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -535,12 +555,6 @@ export default function PeopleCounter() {
     fetch('/api/reset', { method: 'POST' })
       .then(() => console.log('Backend face database cleared!'))
       .catch(err => console.warn('Could not reset backend:', err));
-  };
-
-  const toggleCamera = () => {
-    cancelAnimationFrame(rafRef.current);
-    handleReset();
-    setFacing(f => f === 'user' ? 'environment' : 'user');
   };
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -655,7 +669,6 @@ export default function PeopleCounter() {
           <div className="pc-card pc-controls">
             <p className="pc-card-label">Controls</p>
             <button className="pc-btn pc-btn-danger"    onClick={handleReset}>🔄 Reset Count</button>
-            <button className="pc-btn pc-btn-secondary" onClick={toggleCamera}>🔁 Switch Camera</button>
           </div>
 
           {/* How it works */}
