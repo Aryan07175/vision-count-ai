@@ -41,6 +41,15 @@ The app is split into two parts working together:
 2. **The Brains (Backend):**
    Built with **Python & FastAPI**. When the browser spots a human, it takes a quick snapshot and sends it here. The backend uses a heavier AI (DeepFace) to look at the face and say, "Oh, that's Person #3, we've seen them before."
 
+## 💻 Tech Stack
+
+| Category | Technologies |
+| :--- | :--- |
+| **Frontend UI** | React 19, Vite, Capacitor |
+| **In-Browser AI (Detection)** | TensorFlow.js, COCO-SSD |
+| **Backend API** | Python, FastAPI, Uvicorn |
+| **Server-side AI (Recognition)** | DeepFace, OpenCV, NumPy |
+
 ---
 
 ## 🚀 Want to run it yourself?
