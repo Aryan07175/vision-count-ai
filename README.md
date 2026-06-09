@@ -70,7 +70,7 @@ python -m venv venv
 pip install -r requirements.txt
 
 # Start the server!
-uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 ```
 *(Pro tip: The very first time you run this, it will take a minute or two to download the AI models from the internet. Just let it do its thing!)*
 

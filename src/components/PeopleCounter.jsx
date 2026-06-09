@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import Webcam from 'react-webcam';
 import * as tf from '@tensorflow/tfjs';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
+import { Capacitor } from '@capacitor/core';
 import './PeopleCounter.css';
 
 // ─── CONSTANTS ─────────────────────────────────────────────────────────────────
@@ -9,10 +10,10 @@ const CONFIDENCE      = 0.40;
 const NMS_IOU         = 0.50;
 const NMS_IOM         = 0.85;
 const MIN_FRAMES      = 5;
-const MAX_DISAPPEARED = 45;
-const GHOST_TTL       = 300;
-const MATCH_RATIO     = 0.22;
-const GHOST_RATIO     = 0.30;
+const MAX_DISAPPEARED = 10;
+const GHOST_TTL       = 3;
+const MATCH_RATIO     = 0.08;
+const GHOST_RATIO     = 0.05;
 const DUPE_RATIO      = 0.05;
 const DETECT_MS       = 150;
 const IDENTIFY_TIMEOUT = 10000;  // 10s max wait for DeepFace
@@ -122,16 +123,28 @@ async function identifyPerson(video, box) {
   const base64 = canvas.toDataURL('image/jpeg', 0.8);
   
   try {
-    const res = await fetch('/api/identify', {
+    const isNative = Capacitor.isNativePlatform();
+    const endpoint = isNative 
+      ? 'http://192.168.1.10:8000/api/identify'
+      : '/api/identify';
+      
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_base64: base64 })
+      body: JSON.stringify({ image_base64: base64 }),
+      signal: controller.signal
     });
-    if (!res.ok) throw new Error('API Error');
+    
+    clearTimeout(timeoutId);
+    
+    if (!res.ok) return { error: "backend_error" };
     return await res.json();
   } catch (err) {
     console.warn("DeepFace API error:", err);
-    return null;
+    return { error: "network" };
   }
 }
 
@@ -141,6 +154,7 @@ export default function PeopleCounter() {
   const canvasRef   = useRef(null);
   const rafRef      = useRef(null);
   const lastTickRef = useRef(0);
+  const isDetectingRef = useRef(false);
   const modelRef    = useRef(null);
 
   // Active tracks:  Map<id, { cx, cy, box, appeared, disappeared, counted }>
@@ -148,7 +162,6 @@ export default function PeopleCounter() {
 
   // Ghost registry: Map<id, { cx, cy, frame }>
   // Keeps the last-known position of people who left frame.
-  // Never re-counted because countedIds persists separately.
   const ghostRef    = useRef(new Map());
 
   // Permanent set of every ID ever counted — survives ghost expiry
@@ -161,7 +174,7 @@ export default function PeopleCounter() {
   const [justCounted, setJustCounted] = useState(false);
   const [modelReady,  setModelReady]  = useState(false);
   const [camError,    setCamError]    = useState(false);
-  const [facing]              = useState('user');
+  const [facing,      setFacing]      = useState('user');
   const [inFrame,     setInFrame]     = useState(0);
   const [ghosts,      setGhosts]      = useState(0);
   const [log,         setLog]         = useState([]);
@@ -180,14 +193,17 @@ export default function PeopleCounter() {
 
   // ── Detection loop ──────────────────────────────────────────────────────────
   const detect = useCallback(async () => {
-    const model  = modelRef.current;
-    const webcam = webcamRef.current;
-    const canvas = canvasRef.current;
-    if (!model || !webcam || !canvas) return;
-    const video = webcam.video;
-    if (!video || video.readyState !== 4) return;
-    const vW = video.videoWidth, vH = video.videoHeight;
-    if (!vW || !vH) return;
+    if (isDetectingRef.current) return;
+    isDetectingRef.current = true;
+    try {
+      const model  = modelRef.current;
+      const webcam = webcamRef.current;
+      const canvas = canvasRef.current;
+      if (!model || !webcam || !canvas) return;
+      const video = webcam.video;
+      if (!video || video.readyState !== 4) return;
+      const vW = video.videoWidth, vH = video.videoHeight;
+      if (!vW || !vH) return;
 
     canvas.width = vW; canvas.height = vH;
     const diagLen   = Math.hypot(vW, vH);
@@ -214,7 +230,7 @@ export default function PeopleCounter() {
       };
     });
 
-    const maxDist = Math.max(120, diagLen * MATCH_RATIO);
+    const maxDist = diagLen * MATCH_RATIO;
 
     const active = activeRef.current;
     const ghost  = ghostRef.current;
@@ -224,16 +240,11 @@ export default function PeopleCounter() {
       if (frame - g.frame > GHOST_TTL) ghost.delete(id);
     }
 
-    // ── 3. Match dets → active tracks (2-pass) ─────────────────────────────
+    // ── 3. Match dets → active tracks ─────────────────────────────
     const pass1 = greedyMatch(active, dets, maxDist);
-    const pass2 = greedyMatch(
-      new Map(pass1.unmatchedTracks),
-      pass1.unmatchedDets,
-      maxDist * 2   // wider net for fast movers
-    );
 
     // ── 4. Update matched tracks ───────────────────────────────────────────
-    for (const [id, det] of [...pass1.matched, ...pass2.matched]) {
+    for (const [id, det] of pass1.matched) {
       const prev     = active.get(id);
       const appeared = (prev.appeared || 0) + 1;
       const alreadyCounted = !!prev.counted;
@@ -256,33 +267,32 @@ export default function PeopleCounter() {
           // Asynchronously ask backend
           identifyPerson(video, det.box).then(result => {
             const currentActive = activeRef.current;
-            const currentTrack = currentActive.get(id);
+            const ghostRegistry = ghostRef.current;
+            
+            let trackToUpdate = currentActive.get(id);
+            let isGhost = false;
+            
+            if (!trackToUpdate) {
+              trackToUpdate = ghostRegistry.get(id);
+              isGhost = true;
+            }
+            
+            if (!trackToUpdate) return; // Completely expired
 
             // ── CASE 1: Backend returned a valid person ID ──
             if (result && result.id !== null && result.id !== undefined) {
               const backendId = result.id;
 
-              if (currentTrack) {
-                currentActive.set(id, {
-                  ...currentTrack,
-                  personId: backendId,
-                  counted: true,
-                  identifying: false,
-                  reidentified: result.status === 'recognized'
-                });
-              } else {
-                // They became a ghost while we were identifying
-                const ghostRegistry = ghostRef.current;
-                const g = ghostRegistry.get(id);
-                if (g) {
-                  ghostRegistry.set(id, {
-                    ...g,
-                    personId: backendId,
-                    counted: true,
-                    reidentified: result.status === 'recognized'
-                  });
-                }
-              }
+              trackToUpdate = {
+                ...trackToUpdate,
+                personId: backendId,
+                counted: true,
+                identifying: false,
+                reidentified: result.status === 'recognized'
+              };
+
+              if (isGhost) ghostRegistry.set(id, trackToUpdate);
+              else currentActive.set(id, trackToUpdate);
 
               // ONLY increment count if this is a BRAND NEW person from the backend
               if (!countedIds.current.has(backendId)) {
@@ -294,43 +304,65 @@ export default function PeopleCounter() {
                 const t = new Date().toLocaleTimeString('en-US', { hour12: false });
                 setLog(prevLogs => [{ id: backendId, t }, ...prevLogs].slice(0, 15));
               }
-              // If already counted (recognized), do NOT increment — just update the track silently
 
-            // ── CASE 2: Backend said "no_face" or returned null ──
+            // ── CASE 2: Network Error (Offline) ──
+            } else if (result && result.error === "network") {
+              if (!trackToUpdate.counted) {
+                const anonId = 'Anon-' + id.replace('tmp_', '');
+                
+                trackToUpdate = {
+                  ...trackToUpdate,
+                  personId: anonId,
+                  counted: true,
+                  identifying: false,
+                  reidentified: false
+                };
+                
+                if (isGhost) ghostRegistry.set(id, trackToUpdate);
+                else currentActive.set(id, trackToUpdate);
+                
+                setTotalCount(n => n + 1);
+                setJustCounted(true);
+                clearTimeout(window.countAnimTimeout);
+                window.countAnimTimeout = setTimeout(() => setJustCounted(false), 700);
+                const t = new Date().toLocaleTimeString('en-US', { hour12: false });
+                setLog(prevLogs => [{ id: anonId, t }, ...prevLogs].slice(0, 15));
+              }
+
+            // ── CASE 3: Backend said "no_face" or returned null ──
             } else {
-              if (currentTrack) {
-                // Fallback: If we've tried to find a face for ~4.5 seconds and failed,
-                // we count them anyway as an 'Anon' person so the counter goes up.
-                if (!currentTrack.counted && currentTrack.appeared > 30) {
-                  const anonId = 'Anon-' + id.replace('tmp_', '');
-                  
-                  currentActive.set(id, {
-                    ...currentTrack,
-                    personId: anonId,
-                    counted: true,
-                    identifying: false,
-                    reidentified: false
-                  });
-                  
-                  setTotalCount(n => n + 1);
-                  setJustCounted(true);
-                  clearTimeout(window.countAnimTimeout);
-                  window.countAnimTimeout = setTimeout(() => setJustCounted(false), 700);
-                  const t = new Date().toLocaleTimeString('en-US', { hour12: false });
-                  setLog(prevLogs => [{ id: anonId, t }, ...prevLogs].slice(0, 15));
-                } else {
-                  // Keep trying
-                  currentActive.set(id, { ...currentTrack, identifying: false });
-                }
+              // Fallback: If we've tried to find a face for ~4.5 seconds and failed
+              if (!trackToUpdate.counted && trackToUpdate.appeared > 30) {
+                const anonId = 'Anon-' + id.replace('tmp_', '');
+                
+                trackToUpdate = {
+                  ...trackToUpdate,
+                  personId: anonId,
+                  counted: true,
+                  identifying: false,
+                  reidentified: false
+                };
+                
+                if (isGhost) ghostRegistry.set(id, trackToUpdate);
+                else currentActive.set(id, trackToUpdate);
+                
+                setTotalCount(n => n + 1);
+                setJustCounted(true);
+                clearTimeout(window.countAnimTimeout);
+                window.countAnimTimeout = setTimeout(() => setJustCounted(false), 700);
+                const t = new Date().toLocaleTimeString('en-US', { hour12: false });
+                setLog(prevLogs => [{ id: anonId, t }, ...prevLogs].slice(0, 15));
+              } else {
+                // Keep trying
+                trackToUpdate.identifying = false;
+                if (isGhost) ghostRegistry.set(id, trackToUpdate);
+                else currentActive.set(id, trackToUpdate);
               }
             }
-          }).catch(() => {
-            // ── CASE 3: Network error ──
-            // Do NOT count. Just reset the flag so we retry.
-            const currentTrack = activeRef.current.get(id);
-            if (currentTrack) {
-              activeRef.current.set(id, { ...currentTrack, identifying: false });
-            }
+          }).catch((err) => {
+            console.warn("Unexpected error:", err);
+            const t = activeRef.current.get(id);
+            if (t) activeRef.current.set(id, { ...t, identifying: false });
           });
           continue;
         }
@@ -340,10 +372,7 @@ export default function PeopleCounter() {
     }
 
     // ── 5. Unmatched active tracks: age or ghost ───────────────────────────
-    const allUnmatched = new Set([
-      ...pass1.unmatchedTracks.map(([id]) => id),
-      ...pass2.unmatchedTracks.map(([id]) => id),
-    ]);
+    const allUnmatched = new Set(pass1.unmatchedTracks.map(([id]) => id));
     for (const id of allUnmatched) {
       const t = active.get(id);
       if (!t) continue;
@@ -358,7 +387,7 @@ export default function PeopleCounter() {
     }
 
     // ── 6. Handle unmatched detections ──────────────────────────────────────
-    const finalUnmatched = pass2.unmatchedDets;
+    const finalUnmatched = pass1.unmatchedDets;
 
     for (const det of finalUnmatched) {
 
@@ -522,6 +551,9 @@ export default function PeopleCounter() {
         : `rgba(255,190,50,${Math.max(0.8, fade)})`;
       drawBadge(ctx, drawBx, by - 28, label, badgeC);
     }
+    } finally {
+      isDetectingRef.current = false;
+    }
   }, [facing]);
 
   // ── RAF loop ────────────────────────────────────────────────────────────────
@@ -599,10 +631,20 @@ export default function PeopleCounter() {
                 className="pc-webcam"
                 audio={false}
                 mirrored={facing === 'user'}
-                videoConstraints={{ facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }}
+                videoConstraints={{ facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }}
                 onUserMediaError={() => setCamError(true)}
               />
-              <canvas ref={canvasRef} className="pc-canvas" />
+              <button 
+                className="pc-btn-flip" 
+                onClick={() => setFacing(f => f === 'user' ? 'environment' : 'user')}
+                title="Switch Camera"
+              >
+                🔄
+              </button>
+              <canvas 
+                ref={canvasRef} 
+                className="pc-canvas" 
+              />
               {!modelReady && (
                 <div className="pc-overlay-loading">
                   <div className="pc-spinner" />
