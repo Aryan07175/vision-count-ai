@@ -42,10 +42,10 @@ FRONTEND_ORIGINS = [
     if origin.strip()
 ]
 
-# Allow CORS for the React frontend
+# Allow CORS for the React frontend and mobile apps
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=FRONTEND_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -81,13 +81,17 @@ _id_lock = threading.Lock()
 # 0.30 sits well inside the "different people" zone for Facenet512.
 # Update: 0.30 is too strict for different angles of the same person.
 # Loosening to 0.40 to ensure the same person is matched when they return.
-THRESHOLD = 0.40
+# Update 2: 0.40 is way too loose, causing different people to be matched.
+# Update 3: 0.28 was too strict, rejecting the same person if their angle changed.
+# 0.34 is the perfect "goldilocks" boundary for Facenet512.
+THRESHOLD = 0.34
 
 # FIX: Margin guard — the best match must be this much BETTER than the
 # second-best candidate. If two stored people are almost equally close,
 # the match is ambiguous and we reject it to avoid giving the wrong ID.
 # Update: 0.07 is too strict, reducing to 0.04 to allow close matches.
-MATCH_MARGIN = 0.04
+# Update 2: Removing margin guard (0.00) because it causes the AI to panic and return 'ambiguous' when friends look somewhat similar, which forces the frontend to assign a fallback Anon-X ID and increment the counter.
+MATCH_MARGIN = 0.00
 
 # Minimum confidence area for a face detection to be trusted
 MIN_FACE_AREA = 800  # pixels² — raised slightly to avoid noisy embeddings

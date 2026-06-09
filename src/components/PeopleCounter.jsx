@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import Webcam from 'react-webcam';
 import * as tf from '@tensorflow/tfjs';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
@@ -178,8 +178,22 @@ export default function PeopleCounter() {
   const [inFrame,     setInFrame]     = useState(0);
   const [ghosts,      setGhosts]      = useState(0);
   const [log,         setLog]         = useState([]);
+  const [apiError, setApiError] = useState(false);
+  const [globalError, setGlobalError] = useState(null);
 
-  // ── Load model ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const handleErr = (msg, url, lineNo, columnNo, error) => {
+      setGlobalError(`${msg} (${lineNo}:${columnNo})`);
+      return false;
+    };
+    window.onerror = handleErr;
+    window.addEventListener('unhandledrejection', (e) => setGlobalError(e.reason?.message || "Promise rejected"));
+    return () => {
+      window.onerror = null;
+    };
+  }, []);
+  
+  // Initialize AI models
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -282,6 +296,7 @@ export default function PeopleCounter() {
             // ── CASE 1: Backend returned a valid person ID ──
             if (result && result.id !== null && result.id !== undefined) {
               const backendId = result.id;
+              setApiError(false);
 
               trackToUpdate = {
                 ...trackToUpdate,
@@ -307,6 +322,7 @@ export default function PeopleCounter() {
 
             // ── CASE 2: Network Error (Offline) ──
             } else if (result && result.error === "network") {
+              setApiError(true);
               if (!trackToUpdate.counted) {
                 const anonId = 'Anon-' + id.replace('tmp_', '');
                 
@@ -589,6 +605,12 @@ export default function PeopleCounter() {
       .catch(err => console.warn('Could not reset backend:', err));
   };
 
+  const videoConstraints = useMemo(() => ({
+    facingMode: facing,
+    width: 640,
+    height: 480
+  }), [facing]);
+
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="pc-root">
@@ -654,6 +676,12 @@ export default function PeopleCounter() {
               )}
             </>
           )}
+
+            {apiError && (
+              <div style={{ position: 'absolute', top: 10, left: 10, background: 'rgba(255,0,0,0.8)', color: 'white', padding: '5px 10px', borderRadius: 4, zIndex: 100, fontSize: '0.8rem' }}>
+                Backend unreachable.<br/>Check Firewall / Network.
+              </div>
+            )}
         </div>
 
         <aside className="pc-panel">

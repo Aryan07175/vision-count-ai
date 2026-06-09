@@ -38,6 +38,10 @@ body {
   min-height: 100vh;
   overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: pan-y;
 }
 
 /* ─── Root ───────────────────────────────────────────────────────────────────── */
@@ -220,8 +224,19 @@ body {
 }
 
 @media (max-width: 900px) {
-  .pc-header { padding: 14px 18px; }
-  .pc-main   { grid-template-columns: 1fr; padding: 16px; }
+  .pc-header {
+    padding-top: max(14px, env(safe-area-inset-top));
+    padding-left: max(18px, env(safe-area-inset-left));
+    padding-right: max(18px, env(safe-area-inset-right));
+    padding-bottom: 14px;
+  }
+  .pc-main {
+    grid-template-columns: 1fr;
+    padding-top: 16px;
+    padding-left: max(16px, env(safe-area-inset-left));
+    padding-right: max(16px, env(safe-area-inset-right));
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+  }
 }
 
 /* ─── Camera area ────────────────────────────────────────────────────────────── */
@@ -614,3 +629,34 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #2a3050; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #3a4270; }
+
+@media (max-width: 900px) and (orientation: portrait) {
+  .pc-camera-wrap {
+    aspect-ratio: 3 / 4;
+  }
+}
+
+.pc-btn-flip {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: white;
+  border-radius: 50%;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 10;
+  font-size: 1.2rem;
+  transition: background var(--transition);
+}
+
+.pc-btn-flip:hover {
+  background: rgba(0, 0, 0, 0.7);
+}
