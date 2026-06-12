@@ -186,7 +186,7 @@ export default function PeopleCounter() {
   const [globalError, setGlobalError] = useState(null);
 
   // Session timer
-  const sessionStartRef = useRef(Date.now());
+  const sessionStartRef = useRef(null);
   const [sessionSecs, setSessionSecs] = useState(0);
 
   // ── Global error handler ───────────────────────────────────────────────────
@@ -209,10 +209,14 @@ export default function PeopleCounter() {
 
   // ── Session timer tick ─────────────────────────────────────────────────────
   useEffect(() => {
-    const id = setInterval(() =>
-      setSessionSecs(Math.floor((Date.now() - sessionStartRef.current) / 1000)),
-      1000
-    );
+    if (sessionStartRef.current === null) {
+      sessionStartRef.current = Date.now();
+    }
+    const id = setInterval(() => {
+      if (sessionStartRef.current !== null) {
+        setSessionSecs(Math.floor((Date.now() - sessionStartRef.current) / 1000));
+      }
+    }, 1000);
     return () => clearInterval(id);
   }, []);
 
