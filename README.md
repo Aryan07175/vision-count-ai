@@ -8,99 +8,299 @@ pinned: false
 app_port: 7860
 ---
 
-# 👁️ VisionCount AI
+<div align="center">
 
-Hey there! Welcome to **VisionCount AI**. 
+# 👁‍🗨 VisionCount AI
 
-I built this project to solve a really annoying problem with most people-counting cameras: **double counting**. If someone walks into a room, leaves for a minute, and comes back, most systems count them twice. 
+**Real-time AI-powered people detection, tracking & counting — right in your browser.**
 
-VisionCount fixes this by giving everyone a unique "Face-ID" using artificial intelligence. It runs right in your web browser!
+[![CI — Build & Lint](https://github.com/Aryan07175/vision-count-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/Aryan07175/vision-count-ai/actions/workflows/ci.yml)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-Hugging%20Face-orange?logo=huggingface)](https://aaru07160-vision-count-ai.hf.space/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/Node-20-brightgreen?logo=node.js)](package.json)
+[![Python](https://img.shields.io/badge/Python-3.10-blue?logo=python)](backend/requirements.txt)
 
-🚀 **[Try the Live Demo Here!](https://aaru07160-vision-count-ai.hf.space/)** 🚀
+🚀 **[Try the Live Demo →](https://aaru07160-vision-count-ai.hf.space/)**
 
-*(Note: When you open the live demo, make sure to click "Allow" when your browser asks for camera access!)*
+*(Allow camera access when your browser asks — it's needed to detect people!)*
 
----
-
-## ✨ What makes it cool?
-
-- **Real-Time Tracking:** It uses your webcam to spot people instantly as they walk by.
-- **Smart Memory:** It remembers your face! If you duck out of the camera's view and pop back in, it knows it's still you. No double counting.
-- **Privacy First:** All the facial recognition happens locally or on a secure private server. 
-- **Sleek Interface:** I spent a lot of time making the dashboard look clean, dark, and futuristic. 
+</div>
 
 ---
 
-## 🛠️ How it works (The simple version)
+## 🎯 What Problem Does This Solve?
 
-The app is split into two parts working together:
+Most people-counting systems have a critical flaw: **they count the same person multiple times**. Walk in, walk out, walk back in — that's counted as 3 people instead of 1.
 
-1. **The Web Browser (Frontend):** 
-   Built with **React**. This handles the webcam and draws those cool tracking boxes around people. It uses a lightweight AI (TensorFlow.js) to say, "Hey, I see a human shape!"
+VisionCount AI solves this with two layers of intelligence:
+- **Body tracking** (TensorFlow.js, in-browser) to follow movement frame-by-frame
+- **Face identity** (DeepFace, on server) to assign each person a permanent unique ID so they're never double-counted
 
-2. **The Brains (Backend):**
-   Built with **Python & FastAPI**. When the browser spots a human, it takes a quick snapshot and sends it here. The backend uses a heavier AI (DeepFace) to look at the face and say, "Oh, that's Person #3, we've seen them before."
+---
+
+## ✨ Features
+
+| Feature | Description |
+|---------|-------------|
+| 🎥 **Real-time detection** | COCO-SSD detects people at 150 ms/frame with NMS deduplication |
+| 🧠 **Face recognition** | Facenet512 model assigns a permanent ID per face |
+| 👻 **Ghost memory** | Tracks people who leave the frame; re-matches on return |
+| 🔁 **No double counting** | Same person seen multiple times = counted exactly once |
+| 📡 **Offline fallback** | Backend unreachable? Falls back to anonymous ID counting |
+| 📱 **Mobile-ready** | Capacitor support for native iOS/Android builds |
+| 🌐 **Zero install for users** | Runs fully in-browser — no app download needed |
+
+---
+
+## 🏗️ Architecture & Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          USER'S BROWSER                              │
+│                                                                      │
+│  Webcam Feed ──► TensorFlow.js (COCO-SSD)                           │
+│                       │                                              │
+│                  Person detected?                                    │
+│                       │                                              │
+│                  NMS filter ──► Centroid Tracker                    │
+│                       │              │                               │
+│              New/unidentified     Matched to                        │
+│              person (5+ frames)   existing track                     │
+│                       │                                              │
+│                  Crop face region                                    │
+│                       │                                              │
+└───────────────────────┼──────────────────────────────────────────────┘
+                        │ HTTP POST /api/identify (base64 JPEG crop)
+                        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        FASTAPI BACKEND                               │
+│                                                                      │
+│  Receive image ──► SHA256 cache lookup (4s TTL LRU cache)           │
+│                       │                                              │
+│                  Cache miss?                                         │
+│                       │                                              │
+│            DeepFace.represent()                                      │
+│            (Facenet512, SSD → OpenCV fallback)                      │
+│                       │                                              │
+│            Cosine distance vs. known faces                           │
+│                       │                                              │
+│         Match < 0.34?──► Return existing ID ("recognized")          │
+│         No match?    ──► Assign new ID, store embedding ("new")     │
+│         No face?     ──► Return null ("no_face")                    │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+                        │ JSON { id, status, distance }
+                        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       BROWSER (continued)                            │
+│                                                                      │
+│  Backend ID returned ──► Mark track as counted, log to activity     │
+│  Backend offline     ──► Assign Anon-X ID, continue counting        │
+│  No face detected    ──► Keep trying for 4.5 s, then assign Anon-X  │
+│                                                                      │
+│  Canvas overlay: corner brackets, ID badge, scan progress bar       │
+│  Session timer, live "In Frame" count, ghost memory counter         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### CI/CD Pipeline
+
+```
+Developer pushes code
+        │
+        ▼
+┌───────────────────────┐
+│  GitHub Actions CI    │
+│  (on push / PR)       │
+│                       │
+│  ┌─────────────────┐  │
+│  │  Frontend Job   │  │
+│  │  npm ci         │  │
+│  │  npm run lint   │  │
+│  │  npm run build  │  │
+│  │  Upload dist/   │  │
+│  └─────────────────┘  │
+│  ┌─────────────────┐  │
+│  │  Backend Job    │  │
+│  │  pip install    │  │
+│  │  py_compile     │  │
+│  │  import check   │  │
+│  └─────────────────┘  │
+└───────────────────────┘
+        │ All green ✅
+        ▼
+  PR review & merge → main
+        │
+        ▼
+┌───────────────────────┐
+│  Hugging Face Spaces  │
+│  Docker build         │
+│  Stage 1: npm build   │
+│  Stage 2: pip install │
+│  Expose port 7860     │
+└───────────────────────┘
+```
+
+---
 
 ## 💻 Tech Stack
 
-| Category | Technologies |
-| :--- | :--- |
-| **Frontend UI** | React 19, Vite, Capacitor |
-| **In-Browser AI (Detection)** | TensorFlow.js, COCO-SSD |
-| **Backend API** | Python, FastAPI, Uvicorn |
-| **Server-side AI (Recognition)** | DeepFace, OpenCV, NumPy |
+| Layer | Technology | Purpose |
+|-------|-----------|---------|
+| **Frontend** | React 19 + Vite | UI, webcam access, canvas overlay |
+| **In-Browser AI** | TensorFlow.js + COCO-SSD | Real-time person detection |
+| **Tracker** | Custom centroid + NMS | Frame-to-frame tracking, ghost memory |
+| **Backend API** | FastAPI + Uvicorn | REST API, request serialization |
+| **Face AI** | DeepFace (Facenet512) | Face embedding & identity matching |
+| **Image Processing** | OpenCV + NumPy | CLAHE enhancement, unsharp masking |
+| **Mobile** | Capacitor | Native iOS/Android wrapper |
+| **Deployment** | Docker + Hugging Face Spaces | Cloud hosting, port 7860 |
+| **CI/CD** | GitHub Actions | Lint, build, type-check on every push |
 
 ---
 
-## 🚀 Want to run it yourself?
+## 🚀 Local Development
 
-If you want to download the code and play with it on your own computer, here is how you do it!
+### Prerequisites
 
-### 1. Download the code
+- **Node.js** ≥ 20
+- **Python** ≥ 3.10
+- A webcam
+
+### 1. Clone the repo
+
 ```bash
 git clone https://github.com/Aryan07175/vision-count-ai.git
 cd vision-count-ai
 ```
 
-### 2. Start the AI Backend (Python)
-You'll need Python installed on your computer.
-```bash
-# Go to the backend folder
-cd backend
+### 2. Start the Python Backend
 
-# Create a virtual environment so we don't mess up your computer's Python
+```bash
+# Create a virtual environment
 python -m venv venv
 
-# Activate it (Windows)
+# Activate it
+# Windows:
 .\venv\Scripts\activate
-# (Or on Mac/Linux: source venv/bin/activate)
+# macOS / Linux:
+source venv/bin/activate
 
-# Install the AI libraries
-pip install -r requirements.txt
+# Install dependencies (first run downloads AI models — ~1–2 min)
+pip install -r backend/requirements.txt
 
-# Start the server!
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+# Start the server
+uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
 ```
-*(Pro tip: The very first time you run this, it will take a minute or two to download the AI models from the internet. Just let it do its thing!)*
 
-### 3. Start the Website (React)
-Open a **new** terminal window and go back to the main project folder.
+> **Note:** The very first run will download Facenet512 model weights (~100 MB). Subsequent starts are instant.
+
+### 3. Start the Frontend
+
+Open a **new terminal** in the project root:
+
 ```bash
-# Install the web packages
 npm install
-
-# Start the website
 npm run dev
 ```
 
-That's it! Now just open `http://localhost:5173` in your browser, step in front of your webcam, and watch it count you!
+Open **http://localhost:5173** in your browser, allow camera access, and step in front of your webcam!
+
+### 4. (Optional) Configure Mobile Backend URL
+
+If you're building for Capacitor (native mobile), copy `.env.example` to `.env` and set your machine's LAN IP:
+
+```bash
+cp .env.example .env
+# Edit .env and set:
+# VITE_BACKEND_URL=http://YOUR_LOCAL_IP:8000
+```
+
+---
+
+## 🐳 Docker (Production)
+
+The app ships as a single Docker image — frontend static files served by the FastAPI backend.
+
+```bash
+# Build
+docker build -t vision-count-ai .
+
+# Run (Hugging Face Spaces uses port 7860)
+docker run -p 7860:7860 vision-count-ai
+```
+
+Open **http://localhost:7860**.
+
+---
+
+## 📁 Project Structure
+
+```
+vision-count-ai/
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # GitHub Actions CI pipeline
+├── backend/
+│   ├── app.py                  # FastAPI app — face identity API
+│   └── requirements.txt        # Python dependencies
+├── src/
+│   ├── components/
+│   │   ├── PeopleCounter.jsx   # Main React component
+│   │   └── PeopleCounter.css   # Styles & design tokens
+│   ├── App.jsx
+│   ├── main.jsx
+│   └── index.css
+├── public/                     # Static assets
+├── .env.example                # Env variable docs for mobile builds
+├── Dockerfile                  # Multi-stage build (Node → Python)
+├── index.html                  # HTML entry point
+├── package.json
+└── vite.config.js              # Vite config with /api proxy
+```
+
+---
+
+## ⚙️ Key Configuration
+
+| Variable | Where | Default | Description |
+|----------|-------|---------|-------------|
+| `VITE_BACKEND_URL` | `.env` | `http://192.168.1.10:8000` | Backend URL for Capacitor native builds |
+| `FRONTEND_ORIGINS` | Server env | `*` | Comma-separated allowed CORS origins for production |
+| `CONFIDENCE` | `PeopleCounter.jsx` | `0.40` | Minimum COCO-SSD person confidence |
+| `THRESHOLD` | `app.py` | `0.34` | Facenet512 cosine distance match threshold |
+| `DETECT_MS` | `PeopleCounter.jsx` | `150` | Detection loop interval in milliseconds |
 
 ---
 
 ## 🔧 Troubleshooting
 
-- **The camera is just a black box?** Make sure you clicked "Allow" for camera permissions in your browser. Also, close any other apps (like Zoom) that might be using your webcam.
-- **The counter isn't going up?** Make sure your Python backend is running without errors. If the backend is turned off, the website will switch to "Local Mode" and might struggle to remember faces accurately.
+| Symptom | Fix |
+|---------|-----|
+| **Black camera box** | Click "Allow" for camera permissions, close other apps using the webcam (Zoom, Teams, etc.) |
+| **Counter not going up** | Check backend terminal for errors. Without backend, app uses fallback `Anon-X` IDs |
+| **High CPU usage** | Normal — TensorFlow.js uses WebGL. Close other heavy tabs |
+| **Face not recognized across visits** | Hit **Reset Session** — this clears the face database on the server |
+| **Docker build fails on `libgl1-mesa-glx`** | Update Dockerfile: use `libgl1` instead (already fixed in this repo) |
+
+---
+
+## 🤝 Contributing
+
+1. Fork the repo
+2. Create a branch: `git checkout -b feat/your-feature`
+3. Commit your changes with a clear message
+4. Push and open a Pull Request — the CI pipeline will run automatically
+5. All checks must pass ✅ before merging
+
+---
 
 ## 📄 License
-This project is completely free and open-source under the MIT License. Feel free to use it, change it, and make it your own!
+
+MIT — free to use, modify, and distribute. See [LICENSE](LICENSE) for details.
+
+---
+
+<div align="center">
+Made with ❤️ · <a href="https://aaru07160-vision-count-ai.hf.space/">Live Demo</a> · <a href="https://github.com/Aryan07175/vision-count-ai">GitHub</a>
+</div>

@@ -37,15 +37,17 @@ FRONTEND_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
         "FRONTEND_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
+        "*",  # Default: allow all — override in production via env var
     ).split(",")
     if origin.strip()
 ]
 
-# Allow CORS for the React frontend and mobile apps
+# Allow CORS for the React frontend and mobile apps.
+# Set FRONTEND_ORIGINS env var in production to restrict to your domain.
+_allow_all = FRONTEND_ORIGINS == ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"] if _allow_all else FRONTEND_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
