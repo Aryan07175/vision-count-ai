@@ -1,0 +1,37 @@
+data: {"data":"===== Build Queued at 2026-06-04 07:22:50 / Commit SHA: 912cec8 =====\n","timestamp":"2026-06-04T07:22:50Z"}
+data: {"data":"--> FROM docker.io/library/node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293","timestamp":"2026-06-04T07:22:55.676Z"}
+data: {"data":"DONE 0.0s\n","timestamp":"2026-06-04T07:22:55.676Z"}
+data: {"data":"--> FROM docker.io/library/python:3.10-slim@sha256:70f65c721aaddfb22b20ed6ec12606c59d9592493c5fcb6639f3d0e8ba3fbc10","timestamp":"2026-06-04T07:22:55.676Z"}
+data: {"data":"DONE 0.0s\n","timestamp":"2026-06-04T07:22:55.676Z"}
+data: {"data":"--> WORKDIR /app","timestamp":"2026-06-04T07:22:55.777Z"}
+data: {"data":"CACHED\n","timestamp":"2026-06-04T07:22:55.777Z"}
+data: {"data":"--> COPY package*.json ./","timestamp":"2026-06-04T07:22:55.777Z"}
+data: {"data":"CACHED\n","timestamp":"2026-06-04T07:22:55.777Z"}
+data: {"data":"--> FROM docker.io/library/python:3.10-slim@sha256:70f65c721aaddfb22b20ed6ec12606c59d9592493c5fcb6639f3d0e8ba3fbc10","timestamp":"2026-06-04T07:22:55.777Z"}
+data: {"data":"DONE 0.9s\n","timestamp":"2026-06-04T07:22:56.593Z"}
+data: {"data":"--> RUN npm install","timestamp":"2026-06-04T07:22:56.593Z"}
+data: {"data":"CACHED\n\n--> Restoring cache","timestamp":"2026-06-04T07:22:56.593Z"}
+data: {"data":"DONE 1.3s\n\n--> FROM docker.io/library/python:3.10-slim@sha256:70f65c721aaddfb22b20ed6ec12606c59d9592493c5fcb6639f3d0e8ba3fbc10","timestamp":"2026-06-04T07:22:57.001Z"}
+data: {"data":"DONE 1.5s\n","timestamp":"2026-06-04T07:22:57.164Z"}
+data: {"data":"--> RUN npm install","timestamp":"2026-06-04T07:22:57.164Z"}
+data: {"data":"CACHED\n\n--> Restoring cache","timestamp":"2026-06-04T07:22:57.164Z"}
+data: {"data":"DONE 1.3s\n\n--> FROM docker.io/library/python:3.10-slim@sha256:70f65c721aaddfb22b20ed6ec12606c59d9592493c5fcb6639f3d0e8ba3fbc10","timestamp":"2026-06-04T07:22:57.290Z"}
+data: {"data":"DONE 1.5s\n","timestamp":"2026-06-04T07:22:57.290Z"}
+data: {"data":"--> RUN apt-get update && apt-get install -y --no-install-recommends     wget     build-essential     ca-certificates     libgl1-mesa-glx     libglib2.0-0     && rm -rf /var/lib/apt/lists/*","timestamp":"2026-06-04T07:22:57.441Z"}
+data: {"data":"Hit:1 http://deb.debian.org/debian trixie InRelease","timestamp":"2026-06-04T07:22:57.441Z"}
+data: {"data":"Get:2 http://deb.debian.org/debian trixie-updates InRelease [47.3 kB]","timestamp":"2026-06-04T07:22:57.441Z"}
+data: {"data":"Get:3 http://deb.debian.org/debian-security trixie-security InRelease [43.4 kB]","timestamp":"2026-06-04T07:22:57.441Z"}
+data: {"data":"Get:4 http://deb.debian.org/debian trixie/main amd64 Packages [9671 kB]","timestamp":"2026-06-04T07:22:57.441Z"}
+data: {"data":"Get:5 http://deb.debian.org/debian trixie-updates/main amd64 Packages [5412 B]","timestamp":"2026-06-04T07:22:57.441Z"}
+data: {"data":"Get:6 http://deb.debian.org/debian-security trixie-security/main amd64 Packages [207 kB]","timestamp":"2026-06-04T07:22:57.441Z"}
+data: {"data":"Fetched 9974 kB in 1s (13.0 MB/s)","timestamp":"2026-06-04T07:22:57.987Z"}
+data: {"data":"Reading package lists...","timestamp":"2026-06-04T07:22:58.557Z"}
+data: {"data":"Reading package lists...","timestamp":"2026-06-04T07:22:59.167Z"}
+data: {"data":"Building dependency tree...","timestamp":"2026-06-04T07:22:59.360Z"}
+data: {"data":"Reading state information...","timestamp":"2026-06-04T07:22:59.457Z"}
+data: {"data":"Package libgl1-mesa-glx is not available, but is referred to by another package.","timestamp":"2026-06-04T07:22:59.457Z"}
+data: {"data":"This may mean that the package is missing, has been obsoleted, or","timestamp":"2026-06-04T07:22:59.457Z"}
+data: {"data":"is only available from another source","timestamp":"2026-06-04T07:22:59.457Z"}
+data: {"data":"","timestamp":"2026-06-04T07:22:59.457Z"}
+data: {"data":"E: Package 'libgl1-mesa-glx' has no installation candidate","timestamp":"2026-06-04T07:22:59.457Z"}
+data: {"data":"\n--> ERROR: process \"/bin/sh -c apt-get update && apt-get install -y --no-install-recommends     wget     build-essential     ca-certificates     libgl1-mesa-glx     libglib2.0-0     && rm -rf /var/lib/apt/lists/*\" did not complete successfully: exit code: 100\n","timestamp":"2026-06-04T07:22:59.457Z"}
